@@ -1,0 +1,55 @@
+Secret Net LSP — автоустановка
+Каталог: sn-lsp-auto\
+
+═══════════════════════════════════════════════════════════
+1. На машину заказчика скопируйте:
+   • install_sn_lsp.sh
+   • каталог packages\ с пакетами под НУЖНУЮ ОС
+   • файл .lic (если есть)
+
+2. Разложите пакеты, например:
+
+   packages\
+     sn-lsp_1.12-2509.astra2.12_amd64.deb
+     snlsp-firewall_1.2.2509.astra2.12_amd64.deb
+     — или —
+     sn-lsp-1.12-2509.redos8.0.x86_64.rpm
+     snlsp-firewall-1.2-2509.red80.x86_64.rpm
+     — или —
+     sn-lsp-1.12-2509.alt0.c10f1.x86_64.rpm
+     snlsp-firewall-1.2-2509.alt0.c10f1.x86_64.rpm
+
+3. Запуск (root):
+
+   sudo bash install_sn_lsp.sh \
+     --pkg-dir ./packages \
+     --license ./26962ED_key.lic
+
+4. Если скрипт перезагрузил систему — снова та же команда
+   (состояние в /var/lib/sn-lsp-autoinstall/).
+
+5. Полезно:
+   --dry-run          только план
+   --skip-kernel      не менять ядро
+   --skip-firewall    без ПМЭ
+   --no-reboot        не reboot (код выхода 2)
+
+Политики (snpolctl) скрипт установки НЕ трогает — настройка меню:
+  sudo bash configure_sn_lsp.sh
+
+Лог установки: /var/lib/sn-lsp-autoinstall/install.log
+Кэш ядер: /var/lib/sn-lsp-autoinstall/kernel-cache/
+
+Ядра:
+  Список версий — ТОЛЬКО из пакета SN (/lib/modules/...).
+  Если текущее ядро не подходит, скрипт сам:
+    • включает репозитории ОС (зеркала РЕД ОС / ALT / Astra)
+    • ищет ядро в dnf/apt
+    • ищет kernel-*.rpm рядом в --pkg-dir
+    • монтирует DVD при наличии
+    • качает rpm с mirror.yandex.ru / repo.red-soft.ru
+  Для гарантированного офлайна положите в packages\ файл
+  kernel-lt-<точное-имя-из-матрицы>.rpm
+
+Лог: /var/lib/sn-lsp-autoinstall/install.log
+Кэш ядер: /var/lib/sn-lsp-autoinstall/kernel-cache/

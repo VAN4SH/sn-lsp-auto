@@ -1,0 +1,12 @@
+﻿Astra-Clean — после установки ОС (root или sudo):
+
+  sudo mkdir -p /mnt/snauto
+  sudo mount -t vboxsf snauto /mnt/snauto
+  sudo cp -a /mnt/snauto /root/sn-lsp-auto
+  cd /root/sn-lsp-auto
+  sudo chmod +x install_sn_lsp.sh configure_sn_lsp.sh
+  sudo ./install_sn_lsp.sh --pkg-dir ./packages-astra --license ./packages-astra/26962ED_key.lic
+
+Пакеты: SN 1.12-2509 + ПМЭ 1.2.2509 (astra2.12).
+Shared folder: snauto -> Desktop\Setup\sn-lsp-auto
+SSH с хоста (после включения sshd): 127.0.0.1:2233

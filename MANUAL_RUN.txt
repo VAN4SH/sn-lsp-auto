@@ -1,0 +1,14 @@
+﻿ВМ: RedOS-Clean (VirtualBox), SSH порт хоста 2231, root/root
+
+Файлы на хосте:
+  Desktop\sn-lsp-auto-redos.zip
+  Setup\sn-lsp-auto\sn-install.iso  (если собрался)
+
+В окне ВМ: Devices -> Optical Drives -> Choose a disk file -> sn-install.iso
+Потом в терминале ВМ:
+  mkdir -p /mnt/sn && mount /dev/sr1 /mnt/sn || mount /dev/cdrom /mnt/sn
+  cp -a /mnt/sn/sn-lsp-auto /root/
+  cd /root/sn-lsp-auto
+  sed -i 's/\r$//' install_sn_lsp.sh && chmod +x install_sn_lsp.sh
+  rpm -e --nodeps secretnet snlsp-firewall 2>/dev/null || true
+  bash install_sn_lsp.sh --pkg-dir ./packages --license ./packages/26962ED_key.lic
