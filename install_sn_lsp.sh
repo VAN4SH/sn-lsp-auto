@@ -1759,7 +1759,7 @@ deploy_helper_scripts() {
 main() {
   parse_args "$@"
   need_root
-  ensure_state_di
+  ensure_state_dir
 
   local phase=0
   if [[ -n "$FORCE_PHASE" ]]; then
