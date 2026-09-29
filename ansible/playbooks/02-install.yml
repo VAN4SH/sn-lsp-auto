@@ -9,7 +9,7 @@
 #
 # Перед запуском:
 #   пакеты в корне репо (packages-astra|packages|packages-alt)
-#   sn_license_src в group_vars/all.yml (по умолчанию уже задан для стенда)
+#   sn_license_src в inventory/group_vars/all.yml (по умолчанию уже задан для стенда)
 
 - name: Install Secret Net LSP
   hosts: sn_targets

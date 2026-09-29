@@ -2,7 +2,8 @@
 # Каталог комплекта на целевых хостах
 sn_remote_root: /opt/sn-lsp-auto
 
-# На jump: пакеты лежат в корне комплекта (packages-astra / packages / packages-alt)
+# Пакеты в корне комплекта (packages-astra / packages / packages-alt)
+# playbook_dir = .../ansible/playbooks → корень репо на два уровня выше
 sn_files_root: "{{ playbook_dir }}/../.."
 
 # copy | mirror

@@ -14,7 +14,7 @@
   gather_facts: false
   become: false
   vars_files:
-    - "{{ playbook_dir }}/../group_vars/all.yml"
+    - "{{ playbook_dir }}/../inventory/group_vars/all.yml"
   tasks:
     - name: Make reports directory
       ansible.builtin.file:
@@ -98,7 +98,7 @@
   gather_facts: false
   become: false
   vars_files:
-    - "{{ playbook_dir }}/../group_vars/all.yml"
+    - "{{ playbook_dir }}/../inventory/group_vars/all.yml"
   vars:
     sn_report_path: "{{ hostvars['localhost']['sn_report_path'] }}"
   tasks:
