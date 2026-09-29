@@ -434,8 +434,6 @@ ensure_repos_astra() {
         cat > /etc/apt/sources.list.d/sn-auto-astra.list <<EOF
 # Auto by install_sn_lsp.sh — Astra CE 2.12 (Orel), host=$host
 deb https://${host}/astra/stable/2.12_x86-64/repository/ orel main contrib non-free
-deb https://${host}/astra/stable/orel/repository/ orel main contrib non-free
-deb http://${host}/astra/stable/2.12_x86-64/repository/ orel main contrib non-free
 EOF
         ;;
       se17)
@@ -513,8 +511,6 @@ EOF
 # Auto by install_sn_lsp.sh — Astra CE 2.12 multi-host
 deb https://dl.astralinux.ru/astra/stable/2.12_x86-64/repository/ orel main contrib non-free
 deb https://download.astralinux.ru/astra/stable/2.12_x86-64/repository/ orel main contrib non-free
-deb http://dl.astralinux.ru/astra/stable/2.12_x86-64/repository/ orel main contrib non-free
-deb https://dl.astralinux.ru/astra/stable/orel/repository/ orel main contrib non-free
 EOF
           ;;
         se17)
@@ -1024,16 +1020,77 @@ activate_kernel_redos() {
 
 activate_kernel_astra() {
   local kver="$1" method="$2" ref="$3"
+  local boot_mnt boot_free free_m
   log "Astra: ядро $kver способом $method ($ref)"
   [[ $DRY_RUN -eq 1 ]] && return 0
-  apt-get update -y || true
-  if [[ "$method" == "file" ]]; then
-    DEBIAN_FRONTEND=noninteractive apt-get install -y "$ref"
-  else
-    DEBIAN_FRONTEND=noninteractive apt-get install -y "$ref"
+
+  boot_mnt="/boot"
+  boot_free="$(df -Pm "$boot_mnt" 2>/dev/null | awk 'NR==2 {print $4}')"
+  free_m="${boot_free:-0}"
+  if [[ "$free_m" =~ ^[0-9]+$ ]] && (( free_m < 100 )); then
+    log "ERROR: мало места на /boot: ${free_m} МБ (нужно ≥100)"
+    return 1
   fi
+  log "Свободно на /boot: ${free_m} МБ"
+
+  if [[ -f /etc/apt/sources.list.d/sn-auto-astra.list ]]; then
+    awk '!seen[$0]++' /etc/apt/sources.list.d/sn-auto-astra.list > /tmp/sn-auto-astra.list.$$
+    mv /tmp/sn-auto-astra.list.$$ /etc/apt/sources.list.d/sn-auto-astra.list
+  fi
+
+  apt-get update -y || true
+
+  if ! DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        -o Dpkg::Options::="--force-confdef" \
+        -o Dpkg::Options::="--force-confold" \
+        "$ref"; then
+    log "apt install ядра вернул ошибку — dpkg --configure / apt -f / reinstall"
+    DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true
+    DEBIAN_FRONTEND=noninteractive apt-get -f install -y || true
+    DEBIAN_FRONTEND=noninteractive apt-get install --reinstall -y \
+      -o Dpkg::Options::="--force-confdef" \
+      -o Dpkg::Options::="--force-confold" \
+      "$ref" || true
+  fi
+
+  if [[ ! -e "/boot/vmlinuz-$kver" ]]; then
+    log "ERROR: после установки нет /boot/vmlinuz-$kver"
+    return 1
+  fi
+
+  if [[ ! -f "/boot/config-$kver" ]]; then
+    log "Нет /boot/config-$kver — пробуем headers"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "linux-headers-$kver" 2>/dev/null || true
+    if [[ -f "/usr/src/linux-headers-$kver/.config" ]]; then
+      cp -a "/usr/src/linux-headers-$kver/.config" "/boot/config-$kver"
+    fi
+  fi
+
+  if [[ ! -f "/boot/initrd.img-$kver" ]]; then
+    if [[ -f /etc/initramfs-tools/initramfs.conf ]]; then
+      if grep -qE '^COMPRESS=' /etc/initramfs-tools/initramfs.conf; then
+        sed -i -E 's/^COMPRESS=.*/COMPRESS=gzip/' /etc/initramfs-tools/initramfs.conf
+      else
+        echo 'COMPRESS=gzip' >> /etc/initramfs-tools/initramfs.conf
+      fi
+    fi
+    log "Сборка initrd для $kver"
+    if ! update-initramfs -c -k "$kver"; then
+      if ! update-initramfs -u -k "$kver"; then
+        log "ERROR: initrd для $kver не собрался (часто мало места на /boot или битый пакет)"
+        return 1
+      fi
+    fi
+  fi
+
+  if [[ ! -f "/boot/initrd.img-$kver" ]]; then
+    log "ERROR: нет /boot/initrd.img-$kver"
+    return 1
+  fi
+
   update-grub 2>/dev/null || true
   command -v grub-set-default >/dev/null 2>&1 && grub-set-default 0 || true
+  return 0
 }
 
 activate_kernel_alt() {
@@ -1092,26 +1149,50 @@ ensure_kernel() {
     do_reboot 1
   fi
 
-  resolved="$(resolve_kernel_install || true)"
-  [[ -n "$resolved" ]] || die "Не удалось автоматически достать ни одно ядро из матрицы SN.
+  # Уже выбранное /boot выше обработали. Ставим ядро из матрицы (с запасными вариантами).
+  local tried=()
+  while true; do
+    resolved="$(resolve_kernel_install || true)"
+    [[ -n "$resolved" ]] || break
+    target="${resolved%%|*}"
+    method="$(printf '%s' "$resolved" | cut -d'|' -f2)"
+    ref="$(printf '%s' "$resolved" | cut -d'|' -f3-)"
+    # не зацикливаться на том же ядре
+    local skip=0 t
+    for t in "${tried[@]+"${tried[@]}"}"; do
+      [[ "$t" == "$target" ]] && skip=1 && break
+    done
+    if [[ $skip -eq 1 ]]; then
+      # убрать из видимости: пометить через переменную PKG_KERNELS без этого k — сложно;
+      # для astra просто break после повтора
+      break
+    fi
+    tried+=("$target")
+    log "Целевое ядро: $target | способ: $method | источник: $ref"
+    set +e
+    case "$OS_ID" in
+      astra) activate_kernel_astra "$target" "$method" "$ref"; rc=$? ;;
+      redos) activate_kernel_redos "$target" "$method" "$ref"; rc=$? ;;
+      alt)   activate_kernel_alt "$target" "$method" "$ref"; rc=$? ;;
+      *) rc=1 ;;
+    esac
+    set -e
+    if [[ ${rc:-1} -eq 0 ]]; then
+      do_reboot 1
+    fi
+    log "WARN: ядро $target не встало (rc=${rc:-?}) — пробуем следующее из матрицы"
+    # временно исключить target из списка, чтобы resolve взял другой
+    PKG_KERNELS="$(printf '%s\n' "$PKG_KERNELS" | grep -vxF "$target" || true)"
+    [[ -n "$PKG_KERNELS" ]] || break
+  done
 
-Матрица пакета:
-$PKG_KERNELS
+  die "Не удалось автоматически достать ни одно ядро из матрицы SN (пробовали: ${tried[*]:-ничего}).
 
-Что уже пробовали: репозитории ОС, локальный --pkg-dir, DVD, прямые зеркала.
-Положите в --pkg-dir файл kernel-lt-<uname -r>.rpm (имя как в матрице) и перезапустите."
+Исходная матрица пакета — см. лог выше / содержимое deb.
+Частые причины на Astra: мало места на /boot, сломанный initramfs.
+Проверьте: df -h /boot ; dpkg --configure -a ; apt-get -f install -y
 
-  target="${resolved%%|*}"
-  method="$(printf '%s' "$resolved" | cut -d'|' -f2)"
-  ref="$(printf '%s' "$resolved" | cut -d'|' -f3-)"
-  log "Целевое ядро: $target | способ: $method | источник: $ref"
-
-  case "$OS_ID" in
-    astra) activate_kernel_astra "$target" "$method" "$ref" ;;
-    redos) activate_kernel_redos "$target" "$method" "$ref" ;;
-    alt)   activate_kernel_alt "$target" "$method" "$ref" ;;
-  esac
-  do_reboot 1
+Положите в --pkg-dir готовый linux-image-*.deb из матрицы и перезапустите."
 }
 
 #------------------------------------------------------------------------------
