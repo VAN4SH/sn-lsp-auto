@@ -205,12 +205,12 @@ ansible-playbook playbooks/01-diagnose.yml
 
 # 2) Вручную сверить CSV (ОС, диск, kernel_in_matrix, notes)
 
-# 3) Пилот или волна (нужен root/sudo; если sudo с паролем — добавьте -K)
-ansible-playbook playbooks/02-install.yml --limit arm-01 -K
-ansible-playbook playbooks/02-install.yml --limit @reports/<timestamp>/ready.txt -K
+# 3) Пилот или волна (нужен root/sudo — Ansible спросит пароль BECOME)
+ansible-playbook playbooks/02-install.yml --limit arm-01
+ansible-playbook playbooks/02-install.yml --limit @reports/<timestamp>/ready.txt
 
-# 4) Контроль
-ansible-playbook playbooks/03-status.yml --limit @reports/<timestamp>/ready.txt -K
+# 4) Контроль (тоже может спросить пароль sudo)
+ansible-playbook playbooks/03-status.yml --limit @reports/<timestamp>/ready.txt
 ```
 
 Политики массово не применяются — после PHASE=5 на пилоте: `configure_sn_lsp.sh` / `backup_sn_policies.sh`.
