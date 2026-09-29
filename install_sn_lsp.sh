@@ -273,10 +273,13 @@ astra_parsec_present() {
 astra_parsec_builtin() {
   local kver="$1" cfg="/boot/config-${kver}"
   [[ -f "$cfg" ]] || return 1
-  grep -qE '^CONFIG_PARSEC=y' "$cfg" 2>/dev/null
+  # На Astra CE PARSEC вкомпилен: CONFIG_SECURITY_PARSEC=y (не CONFIG_PARSEC=y)
+  grep -qE '^CONFIG_SECURITY_PARSEC=y' "$cfg" 2>/dev/null \
+    || grep -qE '^CONFIG_DEFAULT_SECURITY_PARSEC=y' "$cfg" 2>/dev/null \
+    || grep -qE '^CONFIG_PARSEC=y' "$cfg" 2>/dev/null
 }
 
-# Готов к загрузке с точки зрения PARSEC (модуль, builtin или можно поставить из apt)
+# Готов к загрузке с точки зрения PARSEC
 astra_parsec_ok() {
   local kver="$1"
   astra_parsec_present "$kver" && return 0
@@ -320,84 +323,72 @@ astra_install_parsec_for_kernel() {
   local kver="$1" p
 
   if astra_parsec_ok "$kver"; then
-    log "PARSEC OK для ${kver} (модуль или builtin)"
+    log "PARSEC OK для ${kver} (модуль или builtin в ядре)"
     depmod "$kver" 2>/dev/null || true
     return 0
   fi
 
-  apt-get update -y || true
-
-  p="$(astra_find_parsec_pkg "$kver" || true)"
-  if [[ -n "$p" ]]; then
-    log "Автоустановка PARSEC: $p"
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --install-recommends "$p" \
-      || DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall "$p" || true
-  else
-    log "В apt нет parsec-* для $kver — reinstall linux-image с recommends"
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --install-recommends --reinstall "linux-image-${kver}" || true
-  fi
-
-  if ! astra_parsec_ok "$kver"; then
-    while IFS= read -r p; do
-      [[ -z "$p" ]] && continue
-      log "Автоустановка PARSEC (поиск): $p"
-      DEBIAN_FRONTEND=noninteractive apt-get install -y --install-recommends "$p" || true
-      astra_parsec_ok "$kver" && break
-    done < <(apt-cache search --names-only . 2>/dev/null | awk -v k="$kver" '
-      index($1, k) && tolower($0) ~ /parsec/ { print $1 }
-    ' | sort -u)
-  fi
-
-  depmod "$kver" 2>/dev/null || true
-
-  if astra_parsec_ok "$kver"; then
-    log "PARSEC OK для $kver"
-    mkdir -p /etc/initramfs-tools
-    touch /etc/initramfs-tools/modules
-    grep -qxF 'parsec' /etc/initramfs-tools/modules 2>/dev/null || echo 'parsec' >> /etc/initramfs-tools/modules
+  # После установки linux-image в /boot появляется config-* — на CE там CONFIG_SECURITY_PARSEC=y
+  if [[ -f "/boot/config-${kver}" ]] && astra_parsec_builtin "$kver"; then
+    log "PARSEC вшит в ядро $kver — отдельный пакет не нужен"
     return 0
   fi
 
-  log "ERROR: PARSEC для $kver недоступен в репозиториях"
+  apt-get update -y || true
+  p="$(astra_find_parsec_pkg "$kver" || true)"
+  if [[ -n "$p" ]]; then
+    log "Автоустановка PARSEC: $p"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --install-recommends "$p" || true
+  else
+    log "На Astra CE пакета parsec-linux-modules обычно нет — reinstall linux-image"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --install-recommends --reinstall "linux-image-${kver}" || true
+  fi
+
+  if astra_parsec_ok "$kver"; then
+    log "PARSEC OK для $kver"
+    return 0
+  fi
+
+  log "ERROR: у $kver нет CONFIG_SECURITY_PARSEC=y и нет модуля parsec"
   return 1
 }
 
-# Полностью автоматический выбор/установка ядра на Astra (без ручных шагов)
+# Автовыбор ядра на Astra CE: достаточно linux-image из матрицы (PARSEC внутри)
 ensure_kernel_astra() {
-  local k img ppkg target
+  local k img target
   local -a ready=() installable=()
 
   ensure_repos_astra
   apt-get update -y || true
 
-  log "Скан матрицы SN: что можно поставить автоматом (linux-image + PARSEC)..."
+  log "Скан матрицы SN (CE: PARSEC вшит в linux-image, отдельный пакет не требуется)..."
   while IFS= read -r k; do
     [[ -z "$k" ]] && continue
     img=""
-    ppkg=""
     apt-cache show "linux-image-$k" &>/dev/null && img="linux-image-$k"
-    ppkg="$(astra_find_parsec_pkg "$k" || true)"
 
     if [[ -e "/boot/vmlinuz-$k" ]] && astra_parsec_ok "$k"; then
       log "  [готово]   $k"
       ready+=("$k")
     elif [[ -n "$img" ]]; then
-      if [[ -n "$ppkg" ]] || astra_parsec_ok "$k"; then
-        log "  [поставим] $k  ($img ${ppkg:+| $ppkg})"
+      log "  [поставим] $k"
+      installable+=("$k")
+    elif [[ -e "/boot/vmlinuz-$k" ]]; then
+      # часто после кривой установки нет config — переустановим image если есть в apt
+      if apt-cache show "linux-image-$k" &>/dev/null; then
+        log "  [починим]  $k"
         installable+=("$k")
       else
-        log "  [пропуск]  $k — есть linux-image, нет PARSEC в apt"
+        log "  [пропуск]  $k — битый /boot без пакета в apt"
       fi
-    elif [[ -e "/boot/vmlinuz-$k" ]]; then
-      log "  [пропуск]  $k — в /boot есть, но PARSEC нет и в apt пакета нет"
     else
-      log "  [пропуск]  $k — нет linux-image в apt"
+      log "  [пропуск]  $k — нет в apt"
     fi
   done <<< "$(printf '%s\n' "$PKG_KERNELS" | sort -V -r)"
 
   if ((${#ready[@]} > 0)); then
     target="$(astra_prefer_generic "${ready[@]}")"
-    log "Переключаем GRUB на уже готовое $target"
+    log "GRUB → готовое $target"
     astra_rebuild_initrd "$target" || return 1
     astra_set_grub_default "$target"
     do_reboot 1
@@ -405,15 +396,12 @@ ensure_kernel_astra() {
 
   if ((${#installable[@]} > 0)); then
     target="$(astra_prefer_generic "${installable[@]}")"
-    log "Автоматически ставим $target (image+PARSEC)"
+    log "Ставим $target автоматически"
     activate_kernel_astra "$target" "dnf" "linux-image-${target}" || return 1
     do_reboot 1
   fi
 
-  log "ERROR: ни одно ядро из матрицы SN нельзя поставить автоматом на этой Astra."
-  log "Текущее ядро $(uname -r) не из матрицы; в apt нет пар linux-image+parsec для поддерживаемых версий."
-  log "Нужны репозитории Astra с пакетами ядер матрицы (часто DVD/расширенный репозиторий заказчика)."
-  log "Пример проверки: apt-cache search linux-image-5.15 | head; apt-cache search parsec | head"
+  log "ERROR: в apt нет linux-image из матрицы SN для этой Astra"
   return 1
 }
 
@@ -1275,13 +1263,10 @@ resolve_kernel_install() {
         fi
         ;;
       astra)
+        # На CE достаточно linux-image (PARSEC вшит). Не требуем несуществующий parsec-* пакет.
         if apt-cache show "linux-image-$k" &>/dev/null; then
-          # Только ядра, для которых в apt есть PARSEC — иначе потом hang
-          if astra_find_parsec_pkg "$k" >/dev/null || astra_parsec_present "$k"; then
-            printf '%s|dnf|linux-image-%s\n' "$k" "$k"
-            return 0
-          fi
-          log "Пропуск $k: в apt нет parsec-модулей под это ядро"
+          printf '%s|dnf|linux-image-%s\n' "$k" "$k"
+          return 0
         fi
         ;;
       alt)
@@ -1361,7 +1346,7 @@ activate_kernel_astra() {
 
   apt-get update -y || true
 
-  # linux-image + PARSEC одной транзакцией apt (автоматом)
+  # linux-image (+ parsec-пакет только если он реально есть в apt; на CE его обычно нет)
   local parsec_pkg=""
   parsec_pkg="$(astra_find_parsec_pkg "$kver" || true)"
   local apt_pkgs=()
