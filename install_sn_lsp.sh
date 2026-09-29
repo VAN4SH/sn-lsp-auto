@@ -259,8 +259,51 @@ boot_has_supported_kernel() {
   return 1
 }
 
-# Astra/Debian: initrd с MODULES=most + драйверы диска с текущей системы
-astra_prepare_initramfs_conf() {
+# Модули PARSEC под целевое ядро (иначе: «init parsec module missing» и зависание)
+astra_install_parsec_for_kernel() {
+  local kver="$1" p found=0
+  local candidates=(
+    "parsec-linux-modules-${kver}"
+    "linux-modules-parsec-${kver}"
+    "astra-parsec-modules-${kver}"
+  )
+
+  if find "/lib/modules/${kver}" -iname '*parsec*' 2>/dev/null | grep -q .; then
+    log "PARSEC уже есть в /lib/modules/${kver}"
+    depmod "$kver" 2>/dev/null || true
+    return 0
+  fi
+
+  for p in "${candidates[@]}"; do
+    if apt-cache show "$p" &>/dev/null; then
+      log "Ставим $p"
+      if DEBIAN_FRONTEND=noninteractive apt-get install -y "$p"; then
+        found=1
+        break
+      fi
+    fi
+  done
+
+  if [[ $found -ne 1 ]]; then
+    p="$(apt-cache search --names-only 'parsec' 2>/dev/null | grep -F "$kver" | awk '{print $1}' | head -1 || true)"
+    if [[ -n "$p" ]]; then
+      log "Ставим найденный пакет PARSEC: $p"
+      DEBIAN_FRONTEND=noninteractive apt-get install -y "$p" && found=1 || true
+    fi
+  fi
+
+  depmod "$kver" 2>/dev/null || true
+
+  if find "/lib/modules/${kver}" -iname '*parsec*' 2>/dev/null | grep -q .; then
+    log "PARSEC modules OK для $kver"
+    # в initrd тоже
+    grep -qxF 'parsec' /etc/initramfs-tools/modules 2>/dev/null || echo 'parsec' >> /etc/initramfs-tools/modules
+    return 0
+  fi
+
+  log "ERROR: нет модулей PARSEC для $kver — с этим ядром Astra не загрузится (parsec module missing)"
+  return 1
+}
   local conf="/etc/initramfs-tools/initramfs.conf"
   mkdir -p /etc/initramfs-tools
   touch "$conf"
@@ -286,7 +329,8 @@ astra_seed_initramfs_modules() {
     nvme nvme_core usb_storage uas \
     ext4 xfs btrfs jfs \
     dm_mod dm_mirror dm_snapshot linear \
-    crc32c crc32c_generic overlay squashfs
+    crc32c crc32c_generic overlay squashfs \
+    parsec
   do
     grep -qxF "$m" "$f" 2>/dev/null || echo "$m" >> "$f"
   done
@@ -354,6 +398,11 @@ astra_set_grub_default() {
   case " $cmdline " in
     *" plymouth.enable=0 "*) ;;
     *) cmdline="${cmdline:+$cmdline }plymouth.enable=0" ;;
+  esac
+  # Astra MAC: без max_ilev часто ломается загрузка/уровни целостности
+  case " $cmdline " in
+    *" parsec.max_ilev="*) ;;
+    *) cmdline="${cmdline:+$cmdline }parsec.max_ilev=63" ;;
   esac
 
   cat > /etc/default/grub.d/99-sn-auto-kernel.cfg <<EOF
@@ -1214,6 +1263,9 @@ activate_kernel_astra() {
     return 1
   fi
 
+  # Критично для Astra: модули PARSEC под ЭТО ядро до reboot
+  astra_install_parsec_for_kernel "$kver" || return 1
+
   astra_rebuild_initrd "$kver" || return 1
   astra_set_grub_default "$kver" || true
   return 0
@@ -1268,6 +1320,7 @@ ensure_kernel() {
         ;;
       astra|alt)
         if [[ "$OS_ID" == "astra" ]]; then
+          astra_install_parsec_for_kernel "$target" || die "Нет PARSEC для уже установленного $target — поставьте parsec-linux-modules-$target"
           astra_rebuild_initrd "$target" || die "Не удалось починить initrd для уже установленного $target"
           astra_set_grub_default "$target"
         else
