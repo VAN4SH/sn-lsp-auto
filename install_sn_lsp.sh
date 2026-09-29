@@ -304,6 +304,9 @@ astra_install_parsec_for_kernel() {
   log "ERROR: нет модулей PARSEC для $kver — с этим ядром Astra не загрузится (parsec module missing)"
   return 1
 }
+
+# Astra/Debian: initrd с MODULES=most + драйверы диска с текущей системы
+astra_prepare_initramfs_conf() {
   local conf="/etc/initramfs-tools/initramfs.conf"
   mkdir -p /etc/initramfs-tools
   touch "$conf"
