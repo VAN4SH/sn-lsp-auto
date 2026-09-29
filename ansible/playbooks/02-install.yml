@@ -53,3 +53,21 @@
     - name: Show status
       ansible.builtin.debug:
         msg: "{{ sn_post.stdout_lines | default(['no output']) }}"
+
+    - name: Ensure configure_sn_lsp.sh is on the host
+      ansible.builtin.copy:
+        src: "{{ sn_kit_root }}/configure_sn_lsp.sh"
+        dest: "{{ sn_remote_root }}/configure_sn_lsp.sh"
+        mode: "0755"
+
+    - name: Ensure backup_sn_policies.sh is on the host
+      ansible.builtin.copy:
+        src: "{{ sn_kit_root }}/backup_sn_policies.sh"
+        dest: "{{ sn_remote_root }}/backup_sn_policies.sh"
+        mode: "0755"
+
+    - name: Remind about policy menu
+      ansible.builtin.debug:
+        msg: >-
+          Политики: sudo bash {{ sn_remote_root }}/configure_sn_lsp.sh
+          (интерактивное меню, массово не запускается)

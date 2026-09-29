@@ -259,7 +259,7 @@ boot_has_supported_kernel() {
   return 1
 }
 
-# Astra/Debian: initrd с MODULES=most (иначе часто panic: unable to mount root fs)
+# Astra/Debian: initrd с MODULES=most + драйверы диска с текущей системы
 astra_prepare_initramfs_conf() {
   local conf="/etc/initramfs-tools/initramfs.conf"
   mkdir -p /etc/initramfs-tools
@@ -276,9 +276,36 @@ astra_prepare_initramfs_conf() {
   fi
 }
 
+# Явно кладём модули диска/ФС в initrd (иначе splash «висит» или panic root fs)
+astra_seed_initramfs_modules() {
+  local f="/etc/initramfs-tools/modules" m root_fs
+  touch "$f"
+  for m in \
+    ahci sd_mod sr_mod ata_piix libata \
+    virtio_blk virtio_pci virtio_scsi virtio_net virtio_mmio \
+    nvme nvme_core usb_storage uas \
+    ext4 xfs btrfs jfs \
+    dm_mod dm_mirror dm_snapshot linear \
+    crc32c crc32c_generic overlay squashfs
+  do
+    grep -qxF "$m" "$f" 2>/dev/null || echo "$m" >> "$f"
+  done
+  # что реально загружено сейчас под root
+  while IFS= read -r m; do
+    [[ -z "$m" ]] && continue
+    grep -qxF "$m" "$f" 2>/dev/null || echo "$m" >> "$f"
+  done < <(lsmod 2>/dev/null | awk 'NR>1 {print $1}' | grep -iE '^(ahci|sd_|sr_|ata_|libata|virtio|nvme|ext4|xfs|btrfs|jfs|dm_|crc32|scsi|megaraid|mpt|uas|usb_storage)' || true)
+  root_fs="$(findmnt -n -o FSTYPE / 2>/dev/null || true)"
+  if [[ -n "$root_fs" ]]; then
+    grep -qxF "$root_fs" "$f" 2>/dev/null || echo "$root_fs" >> "$f"
+  fi
+  log "initramfs modules seed: $(wc -l < "$f") строк"
+}
+
 astra_rebuild_initrd() {
   local kver="$1" sz
   astra_prepare_initramfs_conf
+  astra_seed_initramfs_modules
   [[ -e "/boot/vmlinuz-$kver" ]] || { log "ERROR: нет /boot/vmlinuz-$kver"; return 1; }
 
   if [[ ! -f "/boot/config-$kver" ]]; then
@@ -287,7 +314,7 @@ astra_rebuild_initrd() {
       cp -a "/usr/src/linux-headers-$kver/.config" "/boot/config-$kver"
   fi
 
-  log "Пересборка initrd для $kver (MODULES=most)"
+  log "Пересборка initrd для $kver (MODULES=most + disk modules)"
   update-initramfs -d -k "$kver" 2>/dev/null || true
   if ! update-initramfs -c -k "$kver" 2>&1; then
     update-initramfs -u -k "$kver" 2>&1 || { log "ERROR: update-initramfs не удалось"; return 1; }
@@ -303,10 +330,10 @@ astra_rebuild_initrd() {
   return 0
 }
 
-# Выставить GRUB default на конкретное ядро (не «пункт 0» — он часто старое «Astra Linux»)
+# Выставить GRUB default на конкретное ядро; убрать quiet/splash (иначе «висит» на логотипе)
 astra_set_grub_default() {
   local kver="$1"
-  local grub_cfg entry id submenu_line path line
+  local grub_cfg entry id submenu_line path line cmdline
 
   mkdir -p /etc/default/grub.d
   if [[ -f /etc/default/grub ]]; then
@@ -316,10 +343,26 @@ astra_set_grub_default() {
       echo 'GRUB_DEFAULT=saved' >> /etc/default/grub
     fi
   fi
+
+  cmdline=""
+  if [[ -f /etc/default/grub ]]; then
+    # shellcheck disable=SC1091
+    cmdline="$(. /etc/default/grub 2>/dev/null; printf '%s' "${GRUB_CMDLINE_LINUX_DEFAULT:-}")"
+  fi
+  # убрать quiet/splash — зависание на splash скрывает причину
+  cmdline="$(printf '%s' "$cmdline" | sed -E 's/(^|[[:space:]])quiet($|[[:space:]])/ /g; s/(^|[[:space:]])splash($|[[:space:]])/ /g' | xargs)"
+  case " $cmdline " in
+    *" plymouth.enable=0 "*) ;;
+    *) cmdline="${cmdline:+$cmdline }plymouth.enable=0" ;;
+  esac
+
   cat > /etc/default/grub.d/99-sn-auto-kernel.cfg <<EOF
-# install_sn_lsp.sh — грузить сохранённый default (ядро под SN)
+# install_sn_lsp.sh — ядро под SN, без тихого splash
 GRUB_DEFAULT=saved
 GRUB_SAVEDEFAULT=true
+GRUB_TIMEOUT=5
+GRUB_TIMEOUT_STYLE=menu
+GRUB_CMDLINE_LINUX_DEFAULT="${cmdline}"
 EOF
 
   update-grub 2>/dev/null || true
@@ -335,7 +378,6 @@ EOF
   [[ -z "$id" ]] && id="$(printf '%s\n' "$line" | sed -n "s/.*\$menuentry_id_option[[:space:]]*'\([^']*\)'.*/\1/p")"
   entry="$(printf '%s\n' "$line" | sed -n "s/^[[:space:]]*menuentry[[:space:]]*'\([^']*\)'.*/\1/p")"
 
-  # submenu id перед этим menuentry (Advanced options)
   submenu_line="$(awk -v k="$kver" '
     /^[[:space:]]*submenu / { last=$0; next }
     /menuentry / && index($0, k) { print last; exit }
@@ -365,6 +407,7 @@ EOF
   fi
 
   log "grubenv: $(grub-editenv list 2>/dev/null || echo "(нет)")"
+  log "cmdline: ${cmdline}"
 }
 
 #------------------------------------------------------------------------------
@@ -1394,10 +1437,37 @@ print_summary() {
   systemctl is-active sn.service snkernel.service snstart.service 2>/dev/null || true
   lsmod | grep -E '^sn' || true
   command -v snlicensectl >/dev/null && snlicensectl -s 2>/dev/null || true
+  deploy_helper_scripts
   log "Лог: $LOG_FILE"
   log "Готово."
   rm -f "$MARKER_NEED_REBOOT"
   save_state 5
+}
+
+# configure / backup рядом с установщиком → /opt/sn-lsp-auto/
+deploy_helper_scripts() {
+  local here dest="/opt/sn-lsp-auto" s src
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  mkdir -p "$dest"
+  for s in configure_sn_lsp.sh backup_sn_policies.sh install_sn_lsp.sh; do
+    src=""
+    if [[ -f "$here/$s" ]]; then
+      src="$here/$s"
+    elif [[ -n "${PKG_DIR:-}" && -f "$PKG_DIR/../$s" ]]; then
+      src="$PKG_DIR/../$s"
+    elif [[ -f "/opt/sn-lsp-auto/$s" ]]; then
+      src="/opt/sn-lsp-auto/$s"
+    fi
+    if [[ -n "$src" ]]; then
+      install -m 0755 "$src" "$dest/$s"
+      log "Скрипт: $dest/$s"
+    fi
+  done
+  if [[ -x "$dest/configure_sn_lsp.sh" ]]; then
+    log "Политики (меню): sudo bash $dest/configure_sn_lsp.sh"
+  else
+    log "WARN: configure_sn_lsp.sh не найден — скопируйте вручную в $dest/"
+  fi
 }
 
 #------------------------------------------------------------------------------
