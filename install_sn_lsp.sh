@@ -247,11 +247,15 @@ kernel_supported() {
 }
 
 # Уже стоит в /boot одно из ядер из пакета? (предпочитаем более новое)
+# На Astra без PARSEC ядро не считаем готовым — иначе вечный fail на 5.10.142-hardened.
 boot_has_supported_kernel() {
   local k
   while IFS= read -r k; do
     [[ -z "$k" ]] && continue
     if [[ -e "/boot/vmlinuz-$k" ]]; then
+      if [[ "${OS_ID:-}" == "astra" ]]; then
+        astra_parsec_ok "$k" || continue
+      fi
       printf '%s\n' "$k"
       return 0
     fi
@@ -259,10 +263,34 @@ boot_has_supported_kernel() {
   return 1
 }
 
-# Модули PARSEC под целевое ядро (иначе: «init parsec module missing» и зависание)
+# Модули / встроенный PARSEC под целевое ядро
 astra_parsec_present() {
   local kver="$1"
-  find "/lib/modules/${kver}" \( -iname '*parsec*' -o -iname 'parsec.ko*' \) 2>/dev/null | grep -q .
+  find "/lib/modules/${kver}" \( -iname '*parsec*' -o -iname 'parsec.ko*' \) 2>/dev/null | grep -q . \
+    || modinfo -k "$kver" parsec &>/dev/null
+}
+
+astra_parsec_builtin() {
+  local kver="$1" cfg="/boot/config-${kver}"
+  [[ -f "$cfg" ]] || return 1
+  grep -qE '^CONFIG_PARSEC=y' "$cfg" 2>/dev/null
+}
+
+# Готов к загрузке с точки зрения PARSEC (модуль, builtin или можно поставить из apt)
+astra_parsec_ok() {
+  local kver="$1"
+  astra_parsec_present "$kver" && return 0
+  astra_parsec_builtin "$kver" && return 0
+  return 1
+}
+
+# Среди списка ядер предпочитаем *-generic (на CE с ними меньше сюрпризов, чем hardened)
+astra_prefer_generic() {
+  local k
+  for k in "$@"; do
+    [[ "$k" == *generic* ]] && { printf '%s\n' "$k"; return 0; }
+  done
+  printf '%s\n' "$1"
 }
 
 # Имя пакета PARSEC в apt под данное ядро (или пусто)
@@ -291,8 +319,8 @@ astra_find_parsec_pkg() {
 astra_install_parsec_for_kernel() {
   local kver="$1" p
 
-  if astra_parsec_present "$kver"; then
-    log "PARSEC уже есть в /lib/modules/${kver}"
+  if astra_parsec_ok "$kver"; then
+    log "PARSEC OK для ${kver} (модуль или builtin)"
     depmod "$kver" 2>/dev/null || true
     return 0
   fi
@@ -305,17 +333,16 @@ astra_install_parsec_for_kernel() {
     DEBIAN_FRONTEND=noninteractive apt-get install -y --install-recommends "$p" \
       || DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall "$p" || true
   else
-    log "В apt нет пакета parsec-* для $kver — пробуем дотянуть через linux-image (recommends)"
+    log "В apt нет parsec-* для $kver — reinstall linux-image с recommends"
     DEBIAN_FRONTEND=noninteractive apt-get install -y --install-recommends --reinstall "linux-image-${kver}" || true
   fi
 
-  # ещё раз широкий поиск на случай другого имени
-  if ! astra_parsec_present "$kver"; then
+  if ! astra_parsec_ok "$kver"; then
     while IFS= read -r p; do
       [[ -z "$p" ]] && continue
       log "Автоустановка PARSEC (поиск): $p"
       DEBIAN_FRONTEND=noninteractive apt-get install -y --install-recommends "$p" || true
-      astra_parsec_present "$kver" && break
+      astra_parsec_ok "$kver" && break
     done < <(apt-cache search --names-only . 2>/dev/null | awk -v k="$kver" '
       index($1, k) && tolower($0) ~ /parsec/ { print $1 }
     ' | sort -u)
@@ -323,16 +350,70 @@ astra_install_parsec_for_kernel() {
 
   depmod "$kver" 2>/dev/null || true
 
-  if astra_parsec_present "$kver"; then
-    log "PARSEC modules OK для $kver"
+  if astra_parsec_ok "$kver"; then
+    log "PARSEC OK для $kver"
     mkdir -p /etc/initramfs-tools
     touch /etc/initramfs-tools/modules
     grep -qxF 'parsec' /etc/initramfs-tools/modules 2>/dev/null || echo 'parsec' >> /etc/initramfs-tools/modules
     return 0
   fi
 
-  log "ERROR: автоустановка PARSEC для $kver не удалась (пакета нет в подключённых репозиториях Astra)"
-  log "Проверьте: apt-cache search ${kver} | grep -i parsec"
+  log "ERROR: PARSEC для $kver недоступен в репозиториях"
+  return 1
+}
+
+# Полностью автоматический выбор/установка ядра на Astra (без ручных шагов)
+ensure_kernel_astra() {
+  local k img ppkg target
+  local -a ready=() installable=()
+
+  ensure_repos_astra
+  apt-get update -y || true
+
+  log "Скан матрицы SN: что можно поставить автоматом (linux-image + PARSEC)..."
+  while IFS= read -r k; do
+    [[ -z "$k" ]] && continue
+    img=""
+    ppkg=""
+    apt-cache show "linux-image-$k" &>/dev/null && img="linux-image-$k"
+    ppkg="$(astra_find_parsec_pkg "$k" || true)"
+
+    if [[ -e "/boot/vmlinuz-$k" ]] && astra_parsec_ok "$k"; then
+      log "  [готово]   $k"
+      ready+=("$k")
+    elif [[ -n "$img" ]]; then
+      if [[ -n "$ppkg" ]] || astra_parsec_ok "$k"; then
+        log "  [поставим] $k  ($img ${ppkg:+| $ppkg})"
+        installable+=("$k")
+      else
+        log "  [пропуск]  $k — есть linux-image, нет PARSEC в apt"
+      fi
+    elif [[ -e "/boot/vmlinuz-$k" ]]; then
+      log "  [пропуск]  $k — в /boot есть, но PARSEC нет и в apt пакета нет"
+    else
+      log "  [пропуск]  $k — нет linux-image в apt"
+    fi
+  done <<< "$(printf '%s\n' "$PKG_KERNELS" | sort -V -r)"
+
+  if ((${#ready[@]} > 0)); then
+    target="$(astra_prefer_generic "${ready[@]}")"
+    log "Переключаем GRUB на уже готовое $target"
+    astra_rebuild_initrd "$target" || return 1
+    astra_set_grub_default "$target"
+    do_reboot 1
+  fi
+
+  if ((${#installable[@]} > 0)); then
+    target="$(astra_prefer_generic "${installable[@]}")"
+    log "Автоматически ставим $target (image+PARSEC)"
+    activate_kernel_astra "$target" "dnf" "linux-image-${target}" || return 1
+    do_reboot 1
+  fi
+
+  log "ERROR: ни одно ядро из матрицы SN нельзя поставить автоматом на этой Astra."
+  log "Текущее ядро $(uname -r) не из матрицы; в apt нет пар linux-image+parsec для поддерживаемых версий."
+  log "Нужны репозитории Astra с пакетами ядер матрицы (часто DVD/расширенный репозиторий заказчика)."
+  log "Пример проверки: apt-cache search linux-image-5.15 | head; apt-cache search parsec | head"
   return 1
 }
 
@@ -668,6 +749,8 @@ ensure_repos_astra() {
         cat > /etc/apt/sources.list.d/sn-auto-astra.list <<EOF
 # Auto by install_sn_lsp.sh — Astra CE 2.12 (Orel), host=$host
 deb https://${host}/astra/stable/2.12_x86-64/repository/ orel main contrib non-free
+deb https://${host}/astra/stable/2.12_x86-64/repository-base/ orel main contrib non-free
+deb https://${host}/astra/stable/2.12_x86-64/repository-extended/ orel main contrib non-free
 EOF
         ;;
       se17)
@@ -1352,12 +1435,18 @@ ensure_kernel() {
   log "Ядро $cur НЕТ в матрице $(basename "$SN_PKG") — автоматическая смена"
   [[ $SKIP_KERNEL -eq 1 ]] && die "Несовместимое ядро $cur, а --skip-kernel задан."
 
+  # Astra: отдельный автомат (скан матрицы → поставить image+PARSEC → reboot)
+  if [[ "$OS_ID" == "astra" ]]; then
+    ensure_kernel_astra || die "Автосмена ядра на Astra не удалась (см. скан матрицы в логе выше)."
+    return 0
+  fi
+
   ensure_repos
 
-  # уже в /boot — только если можно безопасно загрузиться (на Astra нужен PARSEC)
+  # уже в /boot
   target="$(boot_has_supported_kernel || true)"
   if [[ -n "$target" && "$target" != "$cur" ]]; then
-    log "В /boot уже есть подходящее ядро: $target"
+    log "Переключаем загрузчик на уже установленное $target"
     [[ $DRY_RUN -eq 1 ]] && return 0
     case "$OS_ID" in
       redos)
@@ -1365,29 +1454,16 @@ ensure_kernel() {
         [[ -f "$initrd" ]] || dracut -f --kver "$target" "$initrd"
         grubby --update-kernel="/boot/vmlinuz-$target" --initrd="$initrd"
         grubby --set-default "/boot/vmlinuz-$target"
-        do_reboot 1
-        ;;
-      astra)
-        if astra_install_parsec_for_kernel "$target" && astra_rebuild_initrd "$target"; then
-          astra_set_grub_default "$target"
-          do_reboot 1
-        fi
-        log "WARN: $target нельзя сделать загрузочным (нет PARSEC/initrd) — пробуем другое ядро из матрицы"
-        PKG_KERNELS="$(printf '%s\n' "$PKG_KERNELS" | grep -vxF "$target" || true)"
-        [[ -n "$PKG_KERNELS" ]] || die "Не осталось ядер в матрице после отказа от $target.
-Поставьте вручную: apt-get install -y parsec-linux-modules-$target
-или другое linux-image из матрицы SN + parsec-linux-modules к нему."
         ;;
       alt)
         update-grub 2>/dev/null || bootloader-reconfigure 2>/dev/null || true
         command -v grubby >/dev/null 2>&1 && [[ -e "/boot/vmlinuz-$target" ]] && \
           grubby --set-default "/boot/vmlinuz-$target" 2>/dev/null || true
-        do_reboot 1
         ;;
     esac
+    do_reboot 1
   fi
 
-  # Уже выбранное /boot выше обработали. Ставим ядро из матрицы (с запасными вариантами).
   local tried=()
   while true; do
     resolved="$(resolve_kernel_install || true)"
@@ -1395,21 +1471,15 @@ ensure_kernel() {
     target="${resolved%%|*}"
     method="$(printf '%s' "$resolved" | cut -d'|' -f2)"
     ref="$(printf '%s' "$resolved" | cut -d'|' -f3-)"
-    # не зацикливаться на том же ядре
     local skip=0 t
     for t in "${tried[@]+"${tried[@]}"}"; do
       [[ "$t" == "$target" ]] && skip=1 && break
     done
-    if [[ $skip -eq 1 ]]; then
-      # убрать из видимости: пометить через переменную PKG_KERNELS без этого k — сложно;
-      # для astra просто break после повтора
-      break
-    fi
+    [[ $skip -eq 1 ]] && break
     tried+=("$target")
     log "Целевое ядро: $target | способ: $method | источник: $ref"
     set +e
     case "$OS_ID" in
-      astra) activate_kernel_astra "$target" "$method" "$ref"; rc=$? ;;
       redos) activate_kernel_redos "$target" "$method" "$ref"; rc=$? ;;
       alt)   activate_kernel_alt "$target" "$method" "$ref"; rc=$? ;;
       *) rc=1 ;;
@@ -1418,19 +1488,13 @@ ensure_kernel() {
     if [[ ${rc:-1} -eq 0 ]]; then
       do_reboot 1
     fi
-    log "WARN: ядро $target не встало (rc=${rc:-?}) — пробуем следующее из матрицы"
-    # временно исключить target из списка, чтобы resolve взял другой
+    log "WARN: ядро $target не встало (rc=${rc:-?}) — пробуем следующее"
     PKG_KERNELS="$(printf '%s\n' "$PKG_KERNELS" | grep -vxF "$target" || true)"
     [[ -n "$PKG_KERNELS" ]] || break
   done
 
   die "Не удалось автоматически достать ни одно ядро из матрицы SN (пробовали: ${tried[*]:-ничего}).
-
-Исходная матрица пакета — см. лог выше / содержимое deb.
-Частые причины на Astra: мало места на /boot, сломанный initramfs.
-Проверьте: df -h /boot ; dpkg --configure -a ; apt-get -f install -y
-
-Положите в --pkg-dir готовый linux-image-*.deb из матрицы и перезапустите."
+Положите в --pkg-dir готовый пакет ядра из матрицы и перезапустите."
 }
 
 #------------------------------------------------------------------------------
