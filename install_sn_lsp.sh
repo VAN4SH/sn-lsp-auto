@@ -246,7 +246,7 @@ kernel_supported() {
   return 1
 }
 
-# Уже стоит в /boot одно из ядер из пакета?
+# Уже стоит в /boot одно из ядер из пакета? (предпочитаем более новое)
 boot_has_supported_kernel() {
   local k
   while IFS= read -r k; do
@@ -255,8 +255,116 @@ boot_has_supported_kernel() {
       printf '%s\n' "$k"
       return 0
     fi
-  done <<< "$(printf '%s\n' "$PKG_KERNELS" | sort -V)"
+  done <<< "$(printf '%s\n' "$PKG_KERNELS" | sort -V -r)"
   return 1
+}
+
+# Astra/Debian: initrd с MODULES=most (иначе часто panic: unable to mount root fs)
+astra_prepare_initramfs_conf() {
+  local conf="/etc/initramfs-tools/initramfs.conf"
+  mkdir -p /etc/initramfs-tools
+  touch "$conf"
+  if grep -qE '^[[:space:]]*MODULES=' "$conf"; then
+    sed -i -E 's/^[[:space:]]*MODULES=.*/MODULES=most/' "$conf"
+  else
+    echo 'MODULES=most' >> "$conf"
+  fi
+  if grep -qE '^[[:space:]]*COMPRESS=' "$conf"; then
+    sed -i -E 's/^[[:space:]]*COMPRESS=.*/COMPRESS=gzip/' "$conf"
+  else
+    echo 'COMPRESS=gzip' >> "$conf"
+  fi
+}
+
+astra_rebuild_initrd() {
+  local kver="$1" sz
+  astra_prepare_initramfs_conf
+  [[ -e "/boot/vmlinuz-$kver" ]] || { log "ERROR: нет /boot/vmlinuz-$kver"; return 1; }
+
+  if [[ ! -f "/boot/config-$kver" ]]; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "linux-headers-$kver" 2>/dev/null || true
+    [[ -f "/usr/src/linux-headers-$kver/.config" ]] && \
+      cp -a "/usr/src/linux-headers-$kver/.config" "/boot/config-$kver"
+  fi
+
+  log "Пересборка initrd для $kver (MODULES=most)"
+  update-initramfs -d -k "$kver" 2>/dev/null || true
+  if ! update-initramfs -c -k "$kver" 2>&1; then
+    update-initramfs -u -k "$kver" 2>&1 || { log "ERROR: update-initramfs не удалось"; return 1; }
+  fi
+  [[ -f "/boot/initrd.img-$kver" ]] || { log "ERROR: нет /boot/initrd.img-$kver"; return 1; }
+
+  sz="$(stat -c%s "/boot/initrd.img-$kver" 2>/dev/null || echo 0)"
+  log "initrd размер: $sz байт"
+  if [[ "$sz" =~ ^[0-9]+$ ]] && (( sz < 4000000 )); then
+    log "ERROR: initrd подозрительно маленький — root fs при загрузке скорее всего не смонтируется"
+    return 1
+  fi
+  return 0
+}
+
+# Выставить GRUB default на конкретное ядро (не «пункт 0» — он часто старое «Astra Linux»)
+astra_set_grub_default() {
+  local kver="$1"
+  local grub_cfg entry id submenu_line path line
+
+  mkdir -p /etc/default/grub.d
+  if [[ -f /etc/default/grub ]]; then
+    if grep -qE '^[[:space:]]*GRUB_DEFAULT=' /etc/default/grub; then
+      sed -i -E 's/^[[:space:]]*GRUB_DEFAULT=.*/GRUB_DEFAULT=saved/' /etc/default/grub
+    else
+      echo 'GRUB_DEFAULT=saved' >> /etc/default/grub
+    fi
+  fi
+  cat > /etc/default/grub.d/99-sn-auto-kernel.cfg <<EOF
+# install_sn_lsp.sh — грузить сохранённый default (ядро под SN)
+GRUB_DEFAULT=saved
+GRUB_SAVEDEFAULT=true
+EOF
+
+  update-grub 2>/dev/null || true
+
+  grub_cfg=""
+  for grub_cfg in /boot/grub/grub.cfg /boot/grub2/grub.cfg; do
+    [[ -f "$grub_cfg" ]] && break
+  done
+  [[ -f "$grub_cfg" ]] || { log "WARN: нет grub.cfg"; return 0; }
+
+  line="$(grep -E "menuentry .*${kver}" "$grub_cfg" | head -n1 || true)"
+  id="$(printf '%s\n' "$line" | sed -n "s/.*menuentry_id_option[[:space:]]*'\([^']*\)'.*/\1/p")"
+  [[ -z "$id" ]] && id="$(printf '%s\n' "$line" | sed -n "s/.*\$menuentry_id_option[[:space:]]*'\([^']*\)'.*/\1/p")"
+  entry="$(printf '%s\n' "$line" | sed -n "s/^[[:space:]]*menuentry[[:space:]]*'\([^']*\)'.*/\1/p")"
+
+  # submenu id перед этим menuentry (Advanced options)
+  submenu_line="$(awk -v k="$kver" '
+    /^[[:space:]]*submenu / { last=$0; next }
+    /menuentry / && index($0, k) { print last; exit }
+  ' "$grub_cfg" || true)"
+  path=""
+  if [[ -n "$submenu_line" && -n "$id" ]]; then
+    local sid
+    sid="$(printf '%s\n' "$submenu_line" | sed -n "s/.*menuentry_id_option[[:space:]]*'\([^']*\)'.*/\1/p")"
+    [[ -z "$sid" ]] && sid="$(printf '%s\n' "$submenu_line" | sed -n "s/.*\$menuentry_id_option[[:space:]]*'\([^']*\)'.*/\1/p")"
+    [[ -n "$sid" ]] && path="${sid}>${id}"
+  fi
+  [[ -z "$path" && -n "$id" ]] && path="$id"
+  [[ -z "$path" && -n "$entry" ]] && path="$entry"
+
+  if command -v grub-editenv >/dev/null 2>&1; then
+    grub-editenv /boot/grub/grubenv create 2>/dev/null || \
+      grub-editenv /boot/grub2/grubenv create 2>/dev/null || true
+  fi
+
+  if [[ -n "$path" ]] && command -v grub-set-default >/dev/null 2>&1; then
+    log "GRUB default → $path"
+    grub-set-default "$path" 2>/dev/null || {
+      [[ -n "$entry" ]] && grub-set-default "$entry" 2>/dev/null || true
+    }
+  else
+    log "WARN: не нашли menuentry для $kver"
+  fi
+
+  log "grubenv: $(grub-editenv list 2>/dev/null || echo "(нет)")"
 }
 
 #------------------------------------------------------------------------------
@@ -1040,17 +1148,22 @@ activate_kernel_astra() {
 
   apt-get update -y || true
 
-  if ! DEBIAN_FRONTEND=noninteractive apt-get install -y \
+  # Пакет могли уже поставить прошлым запуском — тогда только initrd+grub
+  if [[ ! -e "/boot/vmlinuz-$kver" ]]; then
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y \
+          -o Dpkg::Options::="--force-confdef" \
+          -o Dpkg::Options::="--force-confold" \
+          "$ref"; then
+      log "apt install ядра вернул ошибку — dpkg --configure / apt -f / reinstall"
+      DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true
+      DEBIAN_FRONTEND=noninteractive apt-get -f install -y || true
+      DEBIAN_FRONTEND=noninteractive apt-get install --reinstall -y \
         -o Dpkg::Options::="--force-confdef" \
         -o Dpkg::Options::="--force-confold" \
-        "$ref"; then
-    log "apt install ядра вернул ошибку — dpkg --configure / apt -f / reinstall"
-    DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true
-    DEBIAN_FRONTEND=noninteractive apt-get -f install -y || true
-    DEBIAN_FRONTEND=noninteractive apt-get install --reinstall -y \
-      -o Dpkg::Options::="--force-confdef" \
-      -o Dpkg::Options::="--force-confold" \
-      "$ref" || true
+        "$ref" || true
+    fi
+  else
+    log "vmlinuz-$kver уже есть — не ставим пакет заново, чиним initrd и GRUB"
   fi
 
   if [[ ! -e "/boot/vmlinuz-$kver" ]]; then
@@ -1058,38 +1171,8 @@ activate_kernel_astra() {
     return 1
   fi
 
-  if [[ ! -f "/boot/config-$kver" ]]; then
-    log "Нет /boot/config-$kver — пробуем headers"
-    DEBIAN_FRONTEND=noninteractive apt-get install -y "linux-headers-$kver" 2>/dev/null || true
-    if [[ -f "/usr/src/linux-headers-$kver/.config" ]]; then
-      cp -a "/usr/src/linux-headers-$kver/.config" "/boot/config-$kver"
-    fi
-  fi
-
-  if [[ ! -f "/boot/initrd.img-$kver" ]]; then
-    if [[ -f /etc/initramfs-tools/initramfs.conf ]]; then
-      if grep -qE '^COMPRESS=' /etc/initramfs-tools/initramfs.conf; then
-        sed -i -E 's/^COMPRESS=.*/COMPRESS=gzip/' /etc/initramfs-tools/initramfs.conf
-      else
-        echo 'COMPRESS=gzip' >> /etc/initramfs-tools/initramfs.conf
-      fi
-    fi
-    log "Сборка initrd для $kver"
-    if ! update-initramfs -c -k "$kver"; then
-      if ! update-initramfs -u -k "$kver"; then
-        log "ERROR: initrd для $kver не собрался (часто мало места на /boot или битый пакет)"
-        return 1
-      fi
-    fi
-  fi
-
-  if [[ ! -f "/boot/initrd.img-$kver" ]]; then
-    log "ERROR: нет /boot/initrd.img-$kver"
-    return 1
-  fi
-
-  update-grub 2>/dev/null || true
-  command -v grub-set-default >/dev/null 2>&1 && grub-set-default 0 || true
+  astra_rebuild_initrd "$kver" || return 1
+  astra_set_grub_default "$kver" || true
   return 0
 }
 
@@ -1141,9 +1224,14 @@ ensure_kernel() {
         grubby --set-default "/boot/vmlinuz-$target"
         ;;
       astra|alt)
-        update-grub 2>/dev/null || bootloader-reconfigure 2>/dev/null || true
-        command -v grubby >/dev/null 2>&1 && [[ -e "/boot/vmlinuz-$target" ]] && \
-          grubby --set-default "/boot/vmlinuz-$target" 2>/dev/null || true
+        if [[ "$OS_ID" == "astra" ]]; then
+          astra_rebuild_initrd "$target" || die "Не удалось починить initrd для уже установленного $target"
+          astra_set_grub_default "$target"
+        else
+          update-grub 2>/dev/null || bootloader-reconfigure 2>/dev/null || true
+          command -v grubby >/dev/null 2>&1 && [[ -e "/boot/vmlinuz-$target" ]] && \
+            grubby --set-default "/boot/vmlinuz-$target" 2>/dev/null || true
+        fi
         ;;
     esac
     do_reboot 1
