@@ -7,6 +7,7 @@
 - name: SN LSP status
   hosts: sn_targets
   gather_facts: false
+  become: true
   tasks:
     - name: Collect status
       ansible.builtin.shell: |

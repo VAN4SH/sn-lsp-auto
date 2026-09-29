@@ -200,16 +200,17 @@ mkdir -p files
 
 ```bash
 # 1) Диагностика → ansible/reports/<timestamp>/summary.csv, ready.txt, blocked.txt
+#    sudo не нужен — достаточно SSH под ansible_user (например administrator)
 ansible-playbook playbooks/01-diagnose.yml
 
 # 2) Вручную сверить CSV (ОС, диск, kernel_in_matrix, notes)
 
-# 3) Пилот или волна
-ansible-playbook playbooks/02-install.yml --limit arm-01
-ansible-playbook playbooks/02-install.yml --limit @reports/<timestamp>/ready.txt
+# 3) Пилот или волна (нужен root/sudo; если sudo с паролем — добавьте -K)
+ansible-playbook playbooks/02-install.yml --limit arm-01 -K
+ansible-playbook playbooks/02-install.yml --limit @reports/<timestamp>/ready.txt -K
 
 # 4) Контроль
-ansible-playbook playbooks/03-status.yml --limit @reports/<timestamp>/ready.txt
+ansible-playbook playbooks/03-status.yml --limit @reports/<timestamp>/ready.txt -K
 ```
 
 Политики массово не применяются — после PHASE=5 на пилоте: `configure_sn_lsp.sh` / `backup_sn_policies.sh`.

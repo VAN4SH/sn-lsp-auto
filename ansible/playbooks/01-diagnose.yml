@@ -86,6 +86,7 @@
 - name: Collect diagnosis from targets
   hosts: sn_targets
   gather_facts: false
+  become: false
   vars:
     sn_kernel_matrix_map: "{{ hostvars['localhost']['sn_kernel_matrix_map'] | default({'astra': {}, 'redos': {}, 'alt': {}}) }}"
   roles:
