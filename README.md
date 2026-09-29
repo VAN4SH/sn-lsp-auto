@@ -181,6 +181,7 @@ Bash-скрипты остаются установщиком. Ansible толь�
 ```bash
 cd ansible
 cp inventory/hosts.example.ini inventory/hosts.ini
+# оставить секцию [controller] с localhost
 # заполнить [arm] и [servers]
 
 mkdir -p files/packages-astra files/packages files/packages-alt

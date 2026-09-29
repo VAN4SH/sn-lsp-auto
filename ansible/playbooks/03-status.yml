@@ -58,7 +58,9 @@
 
 - name: Summary on control node
   hosts: localhost
+  connection: local
   gather_facts: false
+  become: false
   tasks:
     - name: Show lines
       ansible.builtin.debug:
