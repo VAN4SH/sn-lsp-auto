@@ -265,14 +265,31 @@ astra_parsec_present() {
   find "/lib/modules/${kver}" \( -iname '*parsec*' -o -iname 'parsec.ko*' \) 2>/dev/null | grep -q .
 }
 
-astra_install_parsec_for_kernel() {
-  local kver="$1" p found=0
-  local candidates=(
-    "parsec-linux-modules-${kver}"
-    "linux-modules-parsec-${kver}"
+# Имя пакета PARSEC в apt под данное ядро (или пусто)
+astra_find_parsec_pkg() {
+  local kver="$1" p
+  for p in \
+    "parsec-linux-modules-${kver}" \
+    "linux-modules-parsec-${kver}" \
     "astra-parsec-modules-${kver}"
-    "linux-image-${kver}"
-  )
+  do
+    if apt-cache show "$p" &>/dev/null; then
+      printf '%s\n' "$p"
+      return 0
+    fi
+  done
+  p="$(apt-cache search --names-only . 2>/dev/null | awk -v k="$kver" '
+    index($1, k) && tolower($0) ~ /parsec/ { print $1; exit }
+  ' || true)"
+  if [[ -n "$p" ]]; then
+    printf '%s\n' "$p"
+    return 0
+  fi
+  return 1
+}
+
+astra_install_parsec_for_kernel() {
+  local kver="$1" p
 
   if astra_parsec_present "$kver"; then
     log "PARSEC уже есть в /lib/modules/${kver}"
@@ -282,32 +299,27 @@ astra_install_parsec_for_kernel() {
 
   apt-get update -y || true
 
-  log "Поиск пакетов PARSEC для $kver в apt:"
-  apt-cache search --names-only . 2>/dev/null | grep -F "$kver" | grep -iE 'parsec|module' | sed 's/^/  /' | head -n 30 || true
-  apt-cache search parsec 2>/dev/null | sed 's/^/  /' | head -n 20 || true
+  p="$(astra_find_parsec_pkg "$kver" || true)"
+  if [[ -n "$p" ]]; then
+    log "Автоустановка PARSEC: $p"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --install-recommends "$p" \
+      || DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall "$p" || true
+  else
+    log "В apt нет пакета parsec-* для $kver — пробуем дотянуть через linux-image (recommends)"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --install-recommends --reinstall "linux-image-${kver}" || true
+  fi
 
-  for p in "${candidates[@]}"; do
-    if apt-cache show "$p" &>/dev/null; then
-      log "Ставим/переустанавливаем $p"
-      if DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall "$p" \
-        || DEBIAN_FRONTEND=noninteractive apt-get install -y "$p"; then
-        astra_parsec_present "$kver" && found=1 && break
-      fi
-    fi
-  done
-
-  # всё, что apt знает про это ядро и parsec
-  while IFS= read -r p; do
-    [[ -z "$p" ]] && continue
-    log "Ставим из поиска: $p"
-    DEBIAN_FRONTEND=noninteractive apt-get install -y "$p" || true
-    if astra_parsec_present "$kver"; then
-      found=1
-      break
-    fi
-  done < <(apt-cache search --names-only . 2>/dev/null | awk -v k="$kver" '
-    index($1, k) && tolower($0) ~ /parsec/ { print $1 }
-  ' | sort -u)
+  # ещё раз широкий поиск на случай другого имени
+  if ! astra_parsec_present "$kver"; then
+    while IFS= read -r p; do
+      [[ -z "$p" ]] && continue
+      log "Автоустановка PARSEC (поиск): $p"
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --install-recommends "$p" || true
+      astra_parsec_present "$kver" && break
+    done < <(apt-cache search --names-only . 2>/dev/null | awk -v k="$kver" '
+      index($1, k) && tolower($0) ~ /parsec/ { print $1 }
+    ' | sort -u)
+  fi
 
   depmod "$kver" 2>/dev/null || true
 
@@ -319,8 +331,8 @@ astra_install_parsec_for_kernel() {
     return 0
   fi
 
-  log "ERROR: нет модулей PARSEC для $kver (parsec module missing)"
-  log "Вручную: apt-cache search ${kver} | grep -i parsec ; apt-get install -y parsec-linux-modules-${kver}"
+  log "ERROR: автоустановка PARSEC для $kver не удалась (пакета нет в подключённых репозиториях Astra)"
+  log "Проверьте: apt-cache search ${kver} | grep -i parsec"
   return 1
 }
 
@@ -1181,16 +1193,12 @@ resolve_kernel_install() {
         ;;
       astra)
         if apt-cache show "linux-image-$k" &>/dev/null; then
-          # Предпочитаем ядра, для которых в apt есть PARSEC (иначе boot hang)
-          if apt-cache show "parsec-linux-modules-$k" &>/dev/null \
-            || apt-cache search --names-only . 2>/dev/null | awk -v kk="$k" 'index($1,kk) && tolower($0) ~ /parsec/ {found=1} END{exit !found}' \
-            || astra_parsec_present "$k"; then
+          # Только ядра, для которых в apt есть PARSEC — иначе потом hang
+          if astra_find_parsec_pkg "$k" >/dev/null || astra_parsec_present "$k"; then
             printf '%s|dnf|linux-image-%s\n' "$k" "$k"
             return 0
           fi
-          # запасной вариант без явного parsec-пакета — всё равно пробуем (поставим вместе)
-          printf '%s|dnf|linux-image-%s\n' "$k" "$k"
-          return 0
+          log "Пропуск $k: в apt нет parsec-модулей под это ядро"
         fi
         ;;
       alt)
@@ -1270,22 +1278,32 @@ activate_kernel_astra() {
 
   apt-get update -y || true
 
-  # Пакет могли уже поставить прошлым запуском — тогда только initrd+grub
+  # linux-image + PARSEC одной транзакцией apt (автоматом)
+  local parsec_pkg=""
+  parsec_pkg="$(astra_find_parsec_pkg "$kver" || true)"
+  local apt_pkgs=()
+  apt_pkgs+=("$ref")
+  [[ -n "$parsec_pkg" ]] && apt_pkgs+=("$parsec_pkg")
+
   if [[ ! -e "/boot/vmlinuz-$kver" ]]; then
-    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    log "apt install: ${apt_pkgs[*]}"
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y --install-recommends \
           -o Dpkg::Options::="--force-confdef" \
           -o Dpkg::Options::="--force-confold" \
-          "$ref"; then
+          "${apt_pkgs[@]}"; then
       log "apt install ядра вернул ошибку — dpkg --configure / apt -f / reinstall"
       DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true
       DEBIAN_FRONTEND=noninteractive apt-get -f install -y || true
-      DEBIAN_FRONTEND=noninteractive apt-get install --reinstall -y \
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --install-recommends --reinstall \
         -o Dpkg::Options::="--force-confdef" \
         -o Dpkg::Options::="--force-confold" \
-        "$ref" || true
+        "${apt_pkgs[@]}" || true
     fi
   else
-    log "vmlinuz-$kver уже есть — не ставим пакет заново, чиним initrd и GRUB"
+    log "vmlinuz-$kver уже есть — дотягиваем PARSEC и чиним initrd/GRUB"
+    if [[ -n "$parsec_pkg" ]]; then
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --install-recommends "$parsec_pkg" || true
+    fi
   fi
 
   if [[ ! -e "/boot/vmlinuz-$kver" ]]; then
@@ -1293,7 +1311,7 @@ activate_kernel_astra() {
     return 1
   fi
 
-  # Критично для Astra: модули PARSEC под ЭТО ядро до reboot
+  # Добиваем PARSEC, если recommends не подтянули
   astra_install_parsec_for_kernel "$kver" || return 1
 
   astra_rebuild_initrd "$kver" || return 1
