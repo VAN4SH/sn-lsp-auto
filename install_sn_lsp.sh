@@ -260,48 +260,67 @@ boot_has_supported_kernel() {
 }
 
 # Модули PARSEC под целевое ядро (иначе: «init parsec module missing» и зависание)
+astra_parsec_present() {
+  local kver="$1"
+  find "/lib/modules/${kver}" \( -iname '*parsec*' -o -iname 'parsec.ko*' \) 2>/dev/null | grep -q .
+}
+
 astra_install_parsec_for_kernel() {
   local kver="$1" p found=0
   local candidates=(
     "parsec-linux-modules-${kver}"
     "linux-modules-parsec-${kver}"
     "astra-parsec-modules-${kver}"
+    "linux-image-${kver}"
   )
 
-  if find "/lib/modules/${kver}" -iname '*parsec*' 2>/dev/null | grep -q .; then
+  if astra_parsec_present "$kver"; then
     log "PARSEC уже есть в /lib/modules/${kver}"
     depmod "$kver" 2>/dev/null || true
     return 0
   fi
 
+  apt-get update -y || true
+
+  log "Поиск пакетов PARSEC для $kver в apt:"
+  apt-cache search --names-only . 2>/dev/null | grep -F "$kver" | grep -iE 'parsec|module' | sed 's/^/  /' | head -n 30 || true
+  apt-cache search parsec 2>/dev/null | sed 's/^/  /' | head -n 20 || true
+
   for p in "${candidates[@]}"; do
     if apt-cache show "$p" &>/dev/null; then
-      log "Ставим $p"
-      if DEBIAN_FRONTEND=noninteractive apt-get install -y "$p"; then
-        found=1
-        break
+      log "Ставим/переустанавливаем $p"
+      if DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall "$p" \
+        || DEBIAN_FRONTEND=noninteractive apt-get install -y "$p"; then
+        astra_parsec_present "$kver" && found=1 && break
       fi
     fi
   done
 
-  if [[ $found -ne 1 ]]; then
-    p="$(apt-cache search --names-only 'parsec' 2>/dev/null | grep -F "$kver" | awk '{print $1}' | head -1 || true)"
-    if [[ -n "$p" ]]; then
-      log "Ставим найденный пакет PARSEC: $p"
-      DEBIAN_FRONTEND=noninteractive apt-get install -y "$p" && found=1 || true
+  # всё, что apt знает про это ядро и parsec
+  while IFS= read -r p; do
+    [[ -z "$p" ]] && continue
+    log "Ставим из поиска: $p"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "$p" || true
+    if astra_parsec_present "$kver"; then
+      found=1
+      break
     fi
-  fi
+  done < <(apt-cache search --names-only . 2>/dev/null | awk -v k="$kver" '
+    index($1, k) && tolower($0) ~ /parsec/ { print $1 }
+  ' | sort -u)
 
   depmod "$kver" 2>/dev/null || true
 
-  if find "/lib/modules/${kver}" -iname '*parsec*' 2>/dev/null | grep -q .; then
+  if astra_parsec_present "$kver"; then
     log "PARSEC modules OK для $kver"
-    # в initrd тоже
+    mkdir -p /etc/initramfs-tools
+    touch /etc/initramfs-tools/modules
     grep -qxF 'parsec' /etc/initramfs-tools/modules 2>/dev/null || echo 'parsec' >> /etc/initramfs-tools/modules
     return 0
   fi
 
-  log "ERROR: нет модулей PARSEC для $kver — с этим ядром Astra не загрузится (parsec module missing)"
+  log "ERROR: нет модулей PARSEC для $kver (parsec module missing)"
+  log "Вручную: apt-cache search ${kver} | grep -i parsec ; apt-get install -y parsec-linux-modules-${kver}"
   return 1
 }
 
@@ -1162,6 +1181,14 @@ resolve_kernel_install() {
         ;;
       astra)
         if apt-cache show "linux-image-$k" &>/dev/null; then
+          # Предпочитаем ядра, для которых в apt есть PARSEC (иначе boot hang)
+          if apt-cache show "parsec-linux-modules-$k" &>/dev/null \
+            || apt-cache search --names-only . 2>/dev/null | awk -v kk="$k" 'index($1,kk) && tolower($0) ~ /parsec/ {found=1} END{exit !found}' \
+            || astra_parsec_present "$k"; then
+            printf '%s|dnf|linux-image-%s\n' "$k" "$k"
+            return 0
+          fi
+          # запасной вариант без явного parsec-пакета — всё равно пробуем (поставим вместе)
           printf '%s|dnf|linux-image-%s\n' "$k" "$k"
           return 0
         fi
@@ -1309,10 +1336,10 @@ ensure_kernel() {
 
   ensure_repos
 
-  # уже в /boot
+  # уже в /boot — только если можно безопасно загрузиться (на Astra нужен PARSEC)
   target="$(boot_has_supported_kernel || true)"
   if [[ -n "$target" && "$target" != "$cur" ]]; then
-    log "Переключаем загрузчик на уже установленное $target"
+    log "В /boot уже есть подходящее ядро: $target"
     [[ $DRY_RUN -eq 1 ]] && return 0
     case "$OS_ID" in
       redos)
@@ -1320,20 +1347,26 @@ ensure_kernel() {
         [[ -f "$initrd" ]] || dracut -f --kver "$target" "$initrd"
         grubby --update-kernel="/boot/vmlinuz-$target" --initrd="$initrd"
         grubby --set-default "/boot/vmlinuz-$target"
+        do_reboot 1
         ;;
-      astra|alt)
-        if [[ "$OS_ID" == "astra" ]]; then
-          astra_install_parsec_for_kernel "$target" || die "Нет PARSEC для уже установленного $target — поставьте parsec-linux-modules-$target"
-          astra_rebuild_initrd "$target" || die "Не удалось починить initrd для уже установленного $target"
+      astra)
+        if astra_install_parsec_for_kernel "$target" && astra_rebuild_initrd "$target"; then
           astra_set_grub_default "$target"
-        else
-          update-grub 2>/dev/null || bootloader-reconfigure 2>/dev/null || true
-          command -v grubby >/dev/null 2>&1 && [[ -e "/boot/vmlinuz-$target" ]] && \
-            grubby --set-default "/boot/vmlinuz-$target" 2>/dev/null || true
+          do_reboot 1
         fi
+        log "WARN: $target нельзя сделать загрузочным (нет PARSEC/initrd) — пробуем другое ядро из матрицы"
+        PKG_KERNELS="$(printf '%s\n' "$PKG_KERNELS" | grep -vxF "$target" || true)"
+        [[ -n "$PKG_KERNELS" ]] || die "Не осталось ядер в матрице после отказа от $target.
+Поставьте вручную: apt-get install -y parsec-linux-modules-$target
+или другое linux-image из матрицы SN + parsec-linux-modules к нему."
+        ;;
+      alt)
+        update-grub 2>/dev/null || bootloader-reconfigure 2>/dev/null || true
+        command -v grubby >/dev/null 2>&1 && [[ -e "/boot/vmlinuz-$target" ]] && \
+          grubby --set-default "/boot/vmlinuz-$target" 2>/dev/null || true
+        do_reboot 1
         ;;
     esac
-    do_reboot 1
   fi
 
   # Уже выбранное /boot выше обработали. Ставим ядро из матрицы (с запасными вариантами).
