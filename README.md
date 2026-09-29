@@ -184,14 +184,12 @@ cp inventory/hosts.example.ini inventory/hosts.ini
 # оставить секцию [controller] с localhost
 # заполнить [arm] и [servers]
 
-mkdir -p files/packages-astra files/packages files/packages-alt
-# положить sn-lsp / snlsp-firewall и .lic в нужный каталог
-
-# в group_vars/all.yml указать, например:
-# sn_license_src: packages-astra/26962ED_key.lic
+mkdir -p files
+# пакеты и .lic уже в корне репозитория: packages-astra / packages / packages-alt
+# sn_license_src по умолчанию: packages-astra/26962ED_key.lic
 ```
 
-Доставка пакетов:
+Доставка пакетов (каталоги `packages*` в корне репо, для учебного стенда в git):
 
 - `sn_pkg_mode: copy` (по умолчанию) — копирование с jump на каждый хост;
 - `sn_pkg_mode: mirror` + `sn_pkg_url` или `sn_pkg_share` — пакеты с HTTP/общего каталога.

@@ -1,15 +1,8 @@
-# Пакеты и лицензии — только на jump, не в git
-packages/
-packages-*/
-*.lic
-*.deb
-*.rpm
-
-# Ansible: локальные артефакты и файлы на jump
-ansible/files/
-!ansible/files/.gitkeep
+# Локальные артефакты Ansible (пакеты и .lic в репозитории — для учебного стенда)
 ansible/reports/
 !ansible/reports/.gitkeep
+ansible/files/
+!ansible/files/.gitkeep
 ansible/inventory/hosts.ini
 ansible/*.retry
 
@@ -18,3 +11,4 @@ __pycache__/
 *.pyc
 .DS_Store
 *~
+_push.sh

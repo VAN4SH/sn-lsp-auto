@@ -7,9 +7,9 @@
 # Волна по ready-листу:
 #   ansible-playbook playbooks/02-install.yml --limit @reports/<ts>/ready.txt
 #
-# Перед запуском на jump:
-#   ansible/files/packages-astra|packages|packages-alt + .lic
-#   group_vars/all.yml → sn_license_src: packages-astra/ключ.lic
+# Перед запуском:
+#   пакеты в корне репо (packages-astra|packages|packages-alt)
+#   sn_license_src в group_vars/all.yml (по умолчанию уже задан для стенда)
 
 - name: Install Secret Net LSP
   hosts: sn_targets

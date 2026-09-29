@@ -2,11 +2,8 @@
 # Каталог комплекта на целевых хостах
 sn_remote_root: /opt/sn-lsp-auto
 
-# На jump: положите пакеты в ansible/files/
-#   files/packages-astra/   — Astra
-#   files/packages/         — РЕД ОС
-#   files/packages-alt/     — ALT
-sn_files_root: "{{ playbook_dir }}/../files"
+# На jump: пакеты лежат в корне комплекта (packages-astra / packages / packages-alt)
+sn_files_root: "{{ playbook_dir }}/../.."
 
 # copy | mirror
 sn_pkg_mode: copy
@@ -15,15 +12,14 @@ sn_pkg_mode: copy
 sn_pkg_url: ""
 sn_pkg_share: ""
 
-# Относительные имена каталогов пакетов на jump (под sn_files_root)
+# Относительные имена каталогов пакетов (под sn_files_root)
 sn_pkg_dirs:
   astra: packages-astra
   redos: packages
   alt: packages-alt
 
-# Лицензия на jump (путь относительно sn_files_root или абсолютный)
-# Пример: packages-astra/26962ED_key.lic
-sn_license_src: ""
+# Лицензия (учебный стенд; один ключ лежит во всех packages*)
+sn_license_src: packages-astra/26962ED_key.lic
 
 # Минимальное свободное место на / (ГБ) для ready
 sn_min_free_gb: 2
