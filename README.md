@@ -21,6 +21,7 @@
 | `install_sn_lsp.sh` | Автоустановка SN (ядро → пакет → reboot → ПМЭ → лицензия) |
 | `configure_sn_lsp.sh` | Интерактивное меню настройки политик SN |
 | `backup_sn_policies.sh` | Бэкап / сравнение / откат политик (`snpolctl`) |
+| `ansible/` | Плейбуки диагностики и массовой установки с jump-хоста |
 | `packages*` / `packages-astra` / `packages-alt` | Каталоги с deb/rpm и `.lic` (кладите сами) |
 
 ---
@@ -166,6 +167,53 @@ sudo bash backup_sn_policies.sh show 2026-09-21_131500
 
 4. При необходимости — быстрый шаблон (п. 10), затем точечная донастройка под заказчика.
 5. Снять снимок политик: `sudo bash backup_sn_policies.sh backup`.
+
+---
+
+## Ansible (массовая установка с jump-хоста)
+
+Bash-скрипты остаются установщиком. Ansible только собирает факты, копирует комплект и запускает `install_sn_lsp.sh` с учётом reboot/PHASE.
+
+На jump нужны: Ansible 2.12+, SSH к АРМ/серверам, sudo, Python3. Пакеты и `.lic` в git не кладутся.
+
+### Подготовка
+
+```bash
+cd ansible
+cp inventory/hosts.example.ini inventory/hosts.ini
+# заполнить [arm] и [servers]
+
+mkdir -p files/packages-astra files/packages files/packages-alt
+# положить sn-lsp / snlsp-firewall и .lic в нужный каталог
+
+# в group_vars/all.yml указать, например:
+# sn_license_src: packages-astra/26962ED_key.lic
+```
+
+Доставка пакетов:
+
+- `sn_pkg_mode: copy` (по умолчанию) — копирование с jump на каждый хост;
+- `sn_pkg_mode: mirror` + `sn_pkg_url` или `sn_pkg_share` — пакеты с HTTP/общего каталога.
+
+Группы: у `arm` `sn_serial: 5`, у `servers` `sn_serial: 1`.
+
+### Порядок
+
+```bash
+# 1) Диагностика → ansible/reports/<timestamp>/summary.csv, ready.txt, blocked.txt
+ansible-playbook playbooks/01-diagnose.yml
+
+# 2) Вручную сверить CSV (ОС, диск, kernel_in_matrix, notes)
+
+# 3) Пилот или волна
+ansible-playbook playbooks/02-install.yml --limit arm-01
+ansible-playbook playbooks/02-install.yml --limit @reports/<timestamp>/ready.txt
+
+# 4) Контроль
+ansible-playbook playbooks/03-status.yml --limit @reports/<timestamp>/ready.txt
+```
+
+Политики массово не применяются — после PHASE=5 на пилоте: `configure_sn_lsp.sh` / `backup_sn_policies.sh`.
 
 ---
 

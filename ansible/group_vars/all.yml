@@ -1,0 +1,41 @@
+---
+# Каталог комплекта на целевых хостах
+sn_remote_root: /opt/sn-lsp-auto
+
+# На jump: положите пакеты в ansible/files/
+#   files/packages-astra/   — Astra
+#   files/packages/         — РЕД ОС
+#   files/packages-alt/     — ALT
+sn_files_root: "{{ playbook_dir }}/../files"
+
+# copy | mirror
+sn_pkg_mode: copy
+
+# Для mirror: HTTP-каталог или уже смонтированный путь на хосте
+sn_pkg_url: ""
+sn_pkg_share: ""
+
+# Относительные имена каталогов пакетов на jump (под sn_files_root)
+sn_pkg_dirs:
+  astra: packages-astra
+  redos: packages
+  alt: packages-alt
+
+# Лицензия на jump (путь относительно sn_files_root или абсолютный)
+# Пример: packages-astra/26962ED_key.lic
+sn_license_src: ""
+
+# Минимальное свободное место на / (ГБ) для ready
+sn_min_free_gb: 2
+
+# Сколько reboot-циклов установки (PHASE 0→1→3→5) допускаем
+sn_max_reboots: 3
+
+# Таймаут ожидания после reboot
+sn_reboot_timeout: 900
+
+# Отчёты диагностики
+sn_reports_dir: "{{ playbook_dir }}/../reports"
+
+# Корень комплекта sn-lsp-auto (скрипты install/configure/backup)
+sn_kit_root: "{{ playbook_dir }}/../.."

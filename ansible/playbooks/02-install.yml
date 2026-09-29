@@ -1,0 +1,53 @@
+---
+# Установка SN LSP на готовые хосты (после 01-diagnose и ручной сверки).
+#
+# Пилот:
+#   ansible-playbook playbooks/02-install.yml --limit arm-01
+#
+# Волна по ready-листу:
+#   ansible-playbook playbooks/02-install.yml --limit @reports/<ts>/ready.txt
+#
+# Перед запуском на jump:
+#   ansible/files/packages-astra|packages|packages-alt + .lic
+#   group_vars/all.yml → sn_license_src: packages-astra/ключ.lic
+
+- name: Install Secret Net LSP
+  hosts: sn_targets
+  gather_facts: false
+  serial: "{{ sn_serial | default(5) }}"
+  roles:
+    - role: sn_install
+
+- name: Post-install status snapshot
+  hosts: sn_targets
+  gather_facts: false
+  serial: "{{ sn_serial | default(5) }}"
+  tasks:
+    - name: Collect short status
+      ansible.builtin.shell: |
+        set -e
+        export PATH="/opt/secretnet/sbin:/opt/secretnet/bin:$PATH"
+        echo "host=$(hostname -s)"
+        echo "kernel=$(uname -r)"
+        phase=""
+        if [[ -f /var/lib/sn-lsp-autoinstall/state ]]; then
+          phase=$(grep -E '^PHASE=' /var/lib/sn-lsp-autoinstall/state | cut -d= -f2)
+        fi
+        echo "phase=${phase}"
+        if command -v snpolctl >/dev/null 2>&1 || [[ -x /opt/secretnet/bin/snpolctl ]]; then
+          echo "sn=yes"
+        else
+          echo "sn=no"
+        fi
+        if command -v snlicensectl >/dev/null 2>&1 || [[ -x /opt/secretnet/bin/snlicensectl ]]; then
+          snlicensectl -s 2>&1 | head -n 12 | sed 's/^/lic: /'
+        fi
+      args:
+        executable: /bin/bash
+      register: sn_post
+      changed_when: false
+      failed_when: false
+
+    - name: Show status
+      ansible.builtin.debug:
+        msg: "{{ sn_post.stdout_lines | default(['no output']) }}"

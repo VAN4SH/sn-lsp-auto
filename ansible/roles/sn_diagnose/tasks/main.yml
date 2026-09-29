@@ -1,0 +1,73 @@
+---
+- name: Copy collector script
+  ansible.builtin.copy:
+    src: collect.sh
+    dest: /tmp/sn_lsp_collect.sh
+    mode: "0755"
+
+- name: Collect host facts for SN LSP
+  ansible.builtin.command: /tmp/sn_lsp_collect.sh
+  register: sn_collect
+  changed_when: false
+
+- name: Parse collector JSON
+  ansible.builtin.set_fact:
+    sn_diag_raw: "{{ sn_collect.stdout | from_json }}"
+
+- name: Build inventory group list
+  ansible.builtin.set_fact:
+    sn_diag_groups: "{{ group_names | reject('equalto', 'sn_targets') | list | join(',') }}"
+
+- name: Evaluate ready / notes
+  ansible.builtin.set_fact:
+    sn_diag_ready: >-
+      {{
+        (sn_diag_raw.sn_os in ['astra', 'redos', 'alt'])
+        and ((sn_diag_raw.disk_root_free_gb | float) >= (sn_min_free_gb | float))
+      }}
+    sn_diag_notes: >-
+      {{
+        (
+          ([] if sn_diag_raw.sn_os in ['astra', 'redos', 'alt'] else ['unsupported_os'])
+          +
+          ([] if (sn_diag_raw.disk_root_free_gb | float) >= (sn_min_free_gb | float) else ['low_disk'])
+          +
+          (['repos_empty'] if sn_diag_raw.repos_ok == 'no' else [])
+          +
+          (['sn_already_installed'] if sn_diag_raw.sn_installed == 'yes' else [])
+          +
+          (['install_in_progress_phase_' ~ sn_diag_raw.phase]
+             if sn_diag_raw.phase not in ['', '5', none] else [])
+        ) | join(';')
+      }}
+
+- name: Merge diagnosis record
+  ansible.builtin.set_fact:
+    sn_diagnosis:
+      host: "{{ inventory_hostname }}"
+      groups: "{{ sn_diag_groups }}"
+      sn_os: "{{ sn_diag_raw.sn_os }}"
+      os_pretty: "{{ sn_diag_raw.os_pretty }}"
+      os_id_raw: "{{ sn_diag_raw.os_id_raw }}"
+      os_version: "{{ sn_diag_raw.os_version }}"
+      kernel: "{{ sn_diag_raw.kernel }}"
+      arch: "{{ sn_diag_raw.arch }}"
+      ips: "{{ sn_diag_raw.ips }}"
+      mem_mb: "{{ sn_diag_raw.mem_mb }}"
+      disk_root_free_gb: "{{ sn_diag_raw.disk_root_free_gb }}"
+      disk_boot_free_gb: "{{ sn_diag_raw.disk_boot_free_gb }}"
+      selinux: "{{ sn_diag_raw.selinux }}"
+      apparmor: "{{ sn_diag_raw.apparmor }}"
+      repos_ok: "{{ sn_diag_raw.repos_ok }}"
+      sn_installed: "{{ sn_diag_raw.sn_installed }}"
+      sn_pkg: "{{ sn_diag_raw.sn_pkg }}"
+      phase: "{{ sn_diag_raw.phase }}"
+      ready: "{{ 'yes' if sn_diag_ready else 'no' }}"
+      notes: "{{ sn_diag_notes }}"
+      kernel_in_matrix: >-
+        {%- set m = sn_kernel_matrix_map[sn_diag_raw.sn_os] | default({}) -%}
+        {%- if sn_diag_raw.sn_os not in ['astra', 'redos', 'alt'] -%}unknown
+        {%- elif (m | length) == 0 -%}unknown
+        {%- elif sn_diag_raw.kernel in m -%}yes
+        {%- else -%}no
+        {%- endif -%}

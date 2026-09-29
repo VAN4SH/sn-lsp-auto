@@ -1,0 +1,73 @@
+---
+- name: "Attempt {{ sn_attempt }} — run install_sn_lsp.sh --no-reboot"
+  ansible.builtin.command:
+    argv: "{{ sn_install_argv }}"
+    chdir: "{{ sn_remote_root }}"
+  vars:
+    sn_install_argv: >-
+      {{
+        ['bash', sn_remote_root ~ '/install_sn_lsp.sh', '--pkg-dir', sn_remote_pkg, '--no-reboot']
+        + (['--license', sn_remote_license] if (sn_remote_license | length > 0) else [])
+      }}
+  register: sn_install_run
+  failed_when: sn_install_run.rc not in [0, 2]
+  changed_when: sn_install_run.rc in [0, 2]
+
+- name: Show installer tail
+  ansible.builtin.debug:
+    msg: "{{ (sn_install_run.stdout_lines | default([]) + sn_install_run.stderr_lines | default([]))[-30:] }}"
+
+- name: Mark complete when installer exited 0
+  when: sn_install_run.rc == 0
+  block:
+    - name: Read PHASE after success
+      ansible.builtin.shell: |
+        if [[ -f /var/lib/sn-lsp-autoinstall/state ]]; then
+          grep -E '^PHASE=' /var/lib/sn-lsp-autoinstall/state | cut -d= -f2
+        else
+          echo ""
+        fi
+      args:
+        executable: /bin/bash
+      register: sn_phase_after
+      changed_when: false
+
+    - name: Set install complete
+      ansible.builtin.set_fact:
+        sn_install_complete: true
+        sn_final_phase: "{{ sn_phase_after.stdout | trim }}"
+
+- name: Reboot required (exit code 2)
+  when:
+    - sn_install_run.rc == 2
+    - sn_attempt | int < ((sn_max_reboots | int) + 1)
+  block:
+    - name: Reboot host for next PHASE
+      ansible.builtin.reboot:
+        msg: "SN LSP autoinstall reboot (attempt {{ sn_attempt }})"
+        reboot_timeout: "{{ sn_reboot_timeout }}"
+        pre_reboot_delay: 5
+        post_reboot_delay: 30
+
+    - name: Keep looping after reboot
+      ansible.builtin.set_fact:
+        sn_install_complete: false
+
+- name: Fail if reboot still needed on last attempt
+  when:
+    - sn_install_run.rc == 2
+    - sn_attempt | int >= ((sn_max_reboots | int) + 1)
+  ansible.builtin.fail:
+    msg: >-
+      Установка на {{ inventory_hostname }} снова требует reboot после {{ sn_max_reboots }} перезагрузок.
+      Смотрите /var/lib/sn-lsp-autoinstall/install.log
+
+- name: Fail if attempts exhausted without completion
+  when:
+    - not sn_install_complete
+    - sn_install_run.rc not in [0, 2]
+    - sn_attempt | int >= ((sn_max_reboots | int) + 1)
+  ansible.builtin.fail:
+    msg: >-
+      Установка на {{ inventory_hostname }} не завершилась за {{ sn_max_reboots }} reboot.
+      Смотрите /var/lib/sn-lsp-autoinstall/install.log

@@ -1,0 +1,147 @@
+---
+- name: Resolve OS id for package selection
+  ansible.builtin.shell: |
+    set -e
+    . /etc/os-release
+    id="${ID:-}"
+    pretty="${PRETTY_NAME:-}"
+    name="${NAME:-}"
+    os=""
+    case "$id" in
+      astra) os=astra ;;
+      redos|red-os) os=redos ;;
+      altlinux|altlinuxsp|alt) os=alt ;;
+    esac
+    if [[ -z "$os" ]]; then
+      echo "$pretty $name $id" | grep -qi astra && os=astra || true
+      echo "$pretty $name $id" | grep -qiE 'ред.?ос|red.?os' && os=redos || true
+      echo "$pretty $name $id" | grep -qiE 'alt' && os=alt || true
+    fi
+    [[ -n "$os" ]] || { echo "unsupported"; exit 1; }
+    echo "$os"
+  args:
+    executable: /bin/bash
+  register: sn_os_detect
+  changed_when: false
+
+- name: Set OS and package directory names
+  ansible.builtin.set_fact:
+    sn_os: "{{ sn_os_detect.stdout | trim }}"
+    sn_pkg_dirname: "{{ sn_pkg_dirs[sn_os_detect.stdout | trim] }}"
+    sn_install_complete: false
+    sn_remote_pkg: "{{ sn_remote_root }}/{{ sn_pkg_dirs[sn_os_detect.stdout | trim] }}"
+
+- name: Create remote kit directory
+  ansible.builtin.file:
+    path: "{{ sn_remote_root }}"
+    state: directory
+    mode: "0755"
+
+- name: Copy install / configure / backup scripts
+  ansible.builtin.copy:
+    src: "{{ sn_kit_root }}/{{ item }}"
+    dest: "{{ sn_remote_root }}/{{ item }}"
+    mode: "0755"
+  loop:
+    - install_sn_lsp.sh
+    - configure_sn_lsp.sh
+    - backup_sn_policies.sh
+
+- name: Deliver packages (copy mode)
+  when: sn_pkg_mode == 'copy'
+  block:
+    - name: Ensure local package dir exists on jump
+      ansible.builtin.stat:
+        path: "{{ sn_files_root }}/{{ sn_pkg_dirname }}"
+      register: sn_local_pkg
+      delegate_to: localhost
+      become: false
+
+    - name: Fail if packages missing on jump
+      ansible.builtin.assert:
+        that:
+          - sn_local_pkg.stat.exists
+          - sn_local_pkg.stat.isdir
+        fail_msg: >-
+          Нет каталога {{ sn_files_root }}/{{ sn_pkg_dirname }} на jump.
+          Положите пакеты SN/ПМЭ туда или смените sn_pkg_mode.
+
+    - name: Copy packages to host
+      ansible.builtin.copy:
+        src: "{{ sn_files_root }}/{{ sn_pkg_dirname }}/"
+        dest: "{{ sn_remote_pkg }}/"
+
+- name: Deliver packages (mirror mode)
+  when: sn_pkg_mode == 'mirror'
+  block:
+    - name: Use pre-mounted share
+      when: sn_pkg_share | length > 0
+      ansible.builtin.file:
+        src: "{{ sn_pkg_share }}/{{ sn_pkg_dirname }}"
+        dest: "{{ sn_remote_pkg }}"
+        state: link
+        force: true
+
+    - name: Download tree from HTTP URL
+      when: sn_pkg_share | length == 0
+      block:
+        - name: Require sn_pkg_url
+          ansible.builtin.assert:
+            that:
+              - sn_pkg_url | length > 0
+            fail_msg: "sn_pkg_mode=mirror требует sn_pkg_url или sn_pkg_share"
+
+        - name: Create package directory
+          ansible.builtin.file:
+            path: "{{ sn_remote_pkg }}"
+            state: directory
+            mode: "0755"
+
+        - name: Fetch package index listing (wget mirror)
+          ansible.builtin.shell: |
+            set -euo pipefail
+            BASE="{{ sn_pkg_url }}/{{ sn_pkg_dirname }}"
+            DEST="{{ sn_remote_pkg }}"
+            mkdir -p "$DEST"
+            if command -v wget >/dev/null 2>&1; then
+              wget -q -r -np -nH --cut-dirs=1 -R index.html* -P "$DEST" "$BASE/" || \
+              wget -q -r -np -nH -R index.html* -P "$DEST" "$BASE/"
+            else
+              echo "wget не найден; положите пакеты вручную в $DEST" >&2
+              exit 1
+            fi
+            find "$DEST" -type f \( -name '*.deb' -o -name '*.rpm' -o -name '*.lic' \) | head
+          args:
+            executable: /bin/bash
+
+- name: Resolve license path on remote
+  ansible.builtin.set_fact:
+    sn_remote_license: >-
+      {{
+        (sn_remote_root ~ '/' ~ sn_license_src)
+        if (sn_license_src | length > 0 and not (sn_license_src is match('^/')))
+        else (sn_license_src if (sn_license_src | length > 0) else '')
+      }}
+
+- name: Copy license from jump when configured
+  when:
+    - sn_license_src | length > 0
+    - sn_pkg_mode == 'copy'
+  ansible.builtin.copy:
+    src: "{{ sn_license_src if (sn_license_src is match('^/')) else (sn_files_root ~ '/' ~ sn_license_src) }}"
+    dest: "{{ sn_remote_root }}/license.lic"
+    mode: "0600"
+
+- name: Set remote license to copied file
+  when:
+    - sn_license_src | length > 0
+    - sn_pkg_mode == 'copy'
+  ansible.builtin.set_fact:
+    sn_remote_license: "{{ sn_remote_root }}/license.lic"
+
+- name: Install attempts with reboot handling
+  ansible.builtin.include_tasks: attempt.yml
+  loop: "{{ range(1, (sn_max_reboots | int) + 2) | list }}"
+  loop_control:
+    loop_var: sn_attempt
+  when: not sn_install_complete

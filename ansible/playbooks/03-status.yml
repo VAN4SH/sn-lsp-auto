@@ -1,0 +1,68 @@
+---
+# Статус после волны установки (или повторная сверка).
+#
+#   ansible-playbook playbooks/03-status.yml
+#   ansible-playbook playbooks/03-status.yml --limit @reports/<ts>/ready.txt
+
+- name: SN LSP status
+  hosts: sn_targets
+  gather_facts: false
+  tasks:
+    - name: Collect status
+      ansible.builtin.shell: |
+        set -euo pipefail
+        export PATH="/opt/secretnet/sbin:/opt/secretnet/bin:/usr/sbin:/usr/bin:$PATH"
+        host="$(hostname -s)"
+        kernel="$(uname -r)"
+        phase=""
+        if [[ -f /var/lib/sn-lsp-autoinstall/state ]]; then
+          phase="$(grep -E '^PHASE=' /var/lib/sn-lsp-autoinstall/state | head -n1 | cut -d= -f2-)"
+        fi
+        sn="no"
+        if command -v snpolctl >/dev/null 2>&1 || [[ -x /opt/secretnet/bin/snpolctl ]]; then
+          sn="yes"
+        fi
+        lic_mode="n/a"
+        if command -v snlicensectl >/dev/null 2>&1 || [[ -x /opt/secretnet/bin/snlicensectl ]]; then
+          lic_out="$(snlicensectl -s 2>&1 || true)"
+          if echo "$lic_out" | grep -qiE 'demo|демонстрац'; then
+            lic_mode="demo"
+          elif [[ -n "$lic_out" ]]; then
+            lic_mode="licensed"
+          else
+            lic_mode="unknown"
+          fi
+        fi
+        printf '%s\n' "$host|$kernel|$phase|$sn|$lic_mode"
+      args:
+        executable: /bin/bash
+      register: sn_status_line
+      changed_when: false
+      failed_when: false
+
+    - name: Parse status
+      ansible.builtin.set_fact:
+        sn_status:
+          host: "{{ inventory_hostname }}"
+          kernel: "{{ sn_status_line.stdout.split('|')[1] | default('') }}"
+          phase: "{{ sn_status_line.stdout.split('|')[2] | default('') }}"
+          sn_installed: "{{ sn_status_line.stdout.split('|')[3] | default('no') }}"
+          license: "{{ sn_status_line.stdout.split('|')[4] | default('n/a') }}"
+
+    - name: Print
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: phase={{ sn_status.phase }}
+          sn={{ sn_status.sn_installed }} license={{ sn_status.license }}
+          kernel={{ sn_status.kernel }}
+
+- name: Summary on control node
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Show lines
+      ansible.builtin.debug:
+        msg: "{{ item.host }} | phase={{ item.phase }} | sn={{ item.sn_installed }} | license={{ item.license }} | kernel={{ item.kernel }}"
+      loop: "{{ groups['sn_targets'] | map('extract', hostvars, 'sn_status') | select('defined') | list }}"
+      loop_control:
+        label: "{{ item.host | default('?') }}"
