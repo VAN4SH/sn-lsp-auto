@@ -266,8 +266,10 @@ boot_has_supported_kernel() {
 # Модули / встроенный PARSEC под целевое ядро
 astra_parsec_present() {
   local kver="$1"
-  find "/lib/modules/${kver}" \( -iname '*parsec*' -o -iname 'parsec.ko*' \) 2>/dev/null | grep -q . \
-    || modinfo -k "$kver" parsec &>/dev/null
+  # Только loadable parsec.ko (SE). Builtin CE — parsec_kernel в modules.builtin, это не «present».
+  find "/lib/modules/${kver}" \( \
+      -name 'parsec.ko' -o -name 'parsec.ko.xz' -o -name 'parsec.ko.gz' -o -name 'parsec.ko.zst' \
+    \) 2>/dev/null | grep -q .
 }
 
 astra_parsec_builtin() {
@@ -422,24 +424,36 @@ astra_prepare_initramfs_conf() {
   fi
 }
 
-# Явно кладём модули диска/ФС в initrd (иначе splash «висит» или panic root fs)
+# Явно кладём модули диска/ФС в initrd (иначе splash «висит» или panic root fs).
+# ВАЖНО: НЕ писать «parsec» в modules на CE — builtin называется parsec_kernel,
+# а принудительный modprobe parsec даёт «parsec module missing» и зависание.
 astra_seed_initramfs_modules() {
-  local f="/etc/initramfs-tools/modules" m root_fs
+  local kver="${1:-}" f="/etc/initramfs-tools/modules" m root_fs
   touch "$f"
+  # убрать ошибочный seed parsec, если нет реального .ko под целевое ядро
+  if [[ -n "$kver" ]] && ! astra_parsec_present "$kver"; then
+    if grep -qE '^[[:space:]]*parsec([[:space:]]|$)' "$f" 2>/dev/null; then
+      log "Убираем «parsec» из $f (на CE нет parsec.ko — только builtin parsec_kernel)"
+      sed -i -E '/^[[:space:]]*parsec([[:space:]]|$)/d' "$f"
+    fi
+  fi
   for m in \
     ahci sd_mod sr_mod ata_piix libata \
     virtio_blk virtio_pci virtio_scsi virtio_net virtio_mmio \
     nvme nvme_core usb_storage uas \
     ext4 xfs btrfs jfs \
     dm_mod dm_mirror dm_snapshot linear \
-    crc32c crc32c_generic overlay squashfs \
-    parsec
+    crc32c crc32c_generic overlay squashfs
   do
     grep -qxF "$m" "$f" 2>/dev/null || echo "$m" >> "$f"
   done
-  # что реально загружено сейчас под root
+  # Только если есть loadable parsec.ko (SE) — иначе alias сделает astra_fix_parsec_boot
+  if [[ -n "$kver" ]] && astra_parsec_present "$kver"; then
+    grep -qxF "parsec" "$f" 2>/dev/null || echo "parsec" >> "$f"
+  fi
   while IFS= read -r m; do
     [[ -z "$m" ]] && continue
+    [[ "$m" == "parsec" ]] && continue
     grep -qxF "$m" "$f" 2>/dev/null || echo "$m" >> "$f"
   done < <(lsmod 2>/dev/null | awk 'NR>1 {print $1}' | grep -iE '^(ahci|sd_|sr_|ata_|libata|virtio|nvme|ext4|xfs|btrfs|jfs|dm_|crc32|scsi|megaraid|mpt|uas|usb_storage)' || true)
   root_fs="$(findmnt -n -o FSTYPE / 2>/dev/null || true)"
@@ -449,10 +463,113 @@ astra_seed_initramfs_modules() {
   log "initramfs modules seed: $(wc -l < "$f") строк"
 }
 
+# CE: PARSEC вшит как parsec_kernel; хуки/скрипты часто зовут «parsec» → hang.
+# SE: если есть misc/parsec.ko — оставляем; иначе modeswitch 0 + смягчаем хуки.
+astra_fix_parsec_boot() {
+  local kver="$1" mb alias_f hook
+  [[ -e "/boot/vmlinuz-$kver" ]] || return 1
+
+  mkdir -p /etc/modprobe.d \
+    /etc/initramfs-tools/hooks \
+    /etc/initramfs-tools/scripts/init-top
+
+  # Alias: запросы «parsec» → builtin parsec_kernel (имя в modules.builtin на CE)
+  mb="/lib/modules/${kver}/modules.builtin"
+  if astra_parsec_builtin "$kver" || { [[ -f "$mb" ]] && grep -q 'parsec_kernel\.ko' "$mb" 2>/dev/null; }; then
+    alias_f="/etc/modprobe.d/zz-sn-parsec-alias.conf"
+    cat > "$alias_f" <<'EOF'
+# install_sn_lsp.sh — CE: LSM вшит как parsec_kernel; хуки зовут «parsec»
+alias parsec parsec_kernel
+EOF
+    log "modprobe alias: parsec → parsec_kernel ($alias_f)"
+    if [[ -f "$mb" ]] && ! grep -q 'parsec_kernel\.ko' "$mb"; then
+      echo 'kernel/security/parsec/parsec_kernel.ko' >> "$mb"
+    fi
+    depmod "$kver" 2>/dev/null || true
+  fi
+
+  # Если loadable .ko нет — вычистить parsec из modules
+  if ! astra_parsec_present "$kver"; then
+    if [[ -f /etc/initramfs-tools/modules ]] && \
+       grep -qE '^[[:space:]]*parsec([[:space:]]|$)' /etc/initramfs-tools/modules; then
+      sed -i -E '/^[[:space:]]*parsec([[:space:]]|$)/d' /etc/initramfs-tools/modules
+      log "Удалён parsec из /etc/initramfs-tools/modules"
+    fi
+  fi
+
+  # Лабораторный обход MAC, если есть astra-modeswitch (SE) и нет .ko
+  if ! astra_parsec_present "$kver" && command -v astra-modeswitch >/dev/null 2>&1; then
+    log "astra-modeswitch set 0 (нет parsec.ko под $kver — иначе hang на boot)"
+    astra-modeswitch set 0 2>/dev/null || astra-modeswitch 0 2>/dev/null || true
+  fi
+
+  # Смягчить хуки, которые падают с «parsec module missing»
+  while IFS= read -r hook; do
+    [[ -z "$hook" || ! -f "$hook" ]] && continue
+    [[ -f "${hook}.sn-bak" ]] || cp -a "$hook" "${hook}.sn-bak"
+    # заменить жёсткий exit/panic на предупреждение
+    if grep -qE 'parsec module missing|modprobe[[:space:]]+parsec|misc/parsec\.ko' "$hook" 2>/dev/null; then
+      log "Смягчаем initramfs-хук: $hook"
+      cat > "$hook" <<'HOOK'
+#!/bin/sh
+# sn-lsp-auto: original backed up as *.sn-bak — не стопорим boot без parsec.ko (CE/lab)
+case "$1" in
+prereqs) echo ""; exit 0 ;;
+esac
+if modprobe -q parsec 2>/dev/null || modprobe -q parsec_kernel 2>/dev/null; then
+  :
+else
+  echo "sn-lsp-auto: PARSEC module not loaded (builtin/alias ok on CE) — continue"
+fi
+exit 0
+HOOK
+      chmod +x "$hook"
+    fi
+  done < <(find /usr/share/initramfs-tools /etc/initramfs-tools -type f 2>/dev/null \
+    | xargs grep -lE 'parsec module missing|misc/parsec\.ko|modprobe[[:space:]]+parsec' 2>/dev/null || true)
+
+  # Наш безопасный early-hook: alias внутри initrd + не падать
+  cat > /etc/initramfs-tools/hooks/zz-sn-parsec-ce <<'HOOK'
+#!/bin/sh
+set -e
+case "$1" in
+prereqs) echo ""; exit 0 ;;
+esac
+. /usr/share/initramfs-tools/hook-functions
+mkdir -p "$DESTDIR/etc/modprobe.d"
+cat > "$DESTDIR/etc/modprobe.d/zz-sn-parsec-alias.conf" <<'EOF'
+alias parsec parsec_kernel
+EOF
+# скопировать modules.builtin чтобы modprobe видел builtin
+if [ -f "/lib/modules/${version}/modules.builtin" ]; then
+  mkdir -p "$DESTDIR/lib/modules/${version}"
+  cp -a "/lib/modules/${version}/modules.builtin" "$DESTDIR/lib/modules/${version}/" 2>/dev/null || true
+  cp -a "/lib/modules/${version}/modules.builtin.bin" "$DESTDIR/lib/modules/${version}/" 2>/dev/null || true
+fi
+exit 0
+HOOK
+  chmod +x /etc/initramfs-tools/hooks/zz-sn-parsec-ce
+
+  cat > /etc/initramfs-tools/scripts/init-top/zz-sn-parsec-ce <<'HOOK'
+#!/bin/sh
+case "$1" in
+prereqs) echo ""; exit 0 ;;
+esac
+# не блокируем boot: пробуем оба имени
+modprobe -q parsec_kernel 2>/dev/null || true
+modprobe -q parsec 2>/dev/null || true
+exit 0
+HOOK
+  chmod +x /etc/initramfs-tools/scripts/init-top/zz-sn-parsec-ce
+
+  return 0
+}
+
 astra_rebuild_initrd() {
   local kver="$1" sz
   astra_prepare_initramfs_conf
-  astra_seed_initramfs_modules
+  astra_fix_parsec_boot "$kver" || true
+  astra_seed_initramfs_modules "$kver"
   [[ -e "/boot/vmlinuz-$kver" ]] || { log "ERROR: нет /boot/vmlinuz-$kver"; return 1; }
 
   if [[ ! -f "/boot/config-$kver" ]]; then
@@ -461,7 +578,13 @@ astra_rebuild_initrd() {
       cp -a "/usr/src/linux-headers-$kver/.config" "/boot/config-$kver"
   fi
 
-  log "Пересборка initrd для $kver (MODULES=most + disk modules)"
+  # CE: builtin достаточно. SE без .ko — только если modeswitch/хуки смягчены.
+  if ! astra_parsec_ok "$kver"; then
+    log "ERROR: PARSEC не готов для $kver — reboot даст «parsec module missing»"
+    return 1
+  fi
+
+  log "Пересборка initrd для $kver (MODULES=most + disk; без ложного parsec seed)"
   update-initramfs -d -k "$kver" 2>/dev/null || true
   if ! update-initramfs -c -k "$kver" 2>&1; then
     update-initramfs -u -k "$kver" 2>&1 || { log "ERROR: update-initramfs не удалось"; return 1; }
@@ -1636,7 +1759,7 @@ deploy_helper_scripts() {
 main() {
   parse_args "$@"
   need_root
-  ensure_state_dir
+  ensure_state_di
 
   local phase=0
   if [[ -n "$FORCE_PHASE" ]]; then
