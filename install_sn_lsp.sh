@@ -1605,6 +1605,54 @@ ensure_kernel() {
 Положите в --pkg-dir готовый пакет ядра из матрицы и перезапустите."
 }
 
+# preinst/postinst SN 1.12 смотрят ТОЛЬКО `lsb_release -d` и ищут «1.6» или «2.12».
+# На CE 2.12.46 Description часто «Astra Linux» без номера → «Unsupported Astra version»,
+# хотя uname -r уже из матрицы пакета.
+astra_align_lsb_for_sn() {
+  local desc ver tag file
+  desc="$(lsb_release -d 2>/dev/null || true)"
+  if [[ "$desc" == *1.6* || "$desc" == *2.12* ]]; then
+    log "lsb_release -d уже годится для SN: $desc"
+    return 0
+  fi
+  ver=""
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    ver="$(. /etc/os-release; printf '%s %s %s' "${VERSION_ID:-}" "${VERSION:-}" "${PRETTY_NAME:-}")"
+  fi
+  [[ -z "$ver" && -r /etc/astra_version ]] && ver="$(cat /etc/astra_version)"
+  tag=""
+  if [[ "$ver" == *1.6* ]]; then
+    tag="1.6"
+  elif [[ "$ver" == *2.12* || "$ver" == *[Oo]rel* ]]; then
+    tag="2.12"
+  fi
+  if [[ -z "$tag" ]]; then
+    log "WARN: в os-release нет 1.6/2.12 ($ver) — preinst SN может отказаться"
+    return 0
+  fi
+
+  file="/etc/lsb-release"
+  [[ -f "$file" && ! -f "${STATE_DIR}/lsb-release.bak" ]] && cp -a "$file" "${STATE_DIR}/lsb-release.bak"
+  if [[ -f "$file" ]] && grep -q '^DISTRIB_DESCRIPTION=' "$file"; then
+    sed -i "s|^DISTRIB_DESCRIPTION=.*|DISTRIB_DESCRIPTION=\"Astra Linux ${tag}\"|" "$file"
+  else
+    printf 'DISTRIB_ID=AstraLinux\nDISTRIB_RELEASE=%s\nDISTRIB_DESCRIPTION="Astra Linux %s"\n' "$tag" "$tag" >> "$file"
+  fi
+
+  desc="$(lsb_release -d 2>/dev/null || true)"
+  if [[ "$desc" != *"$tag"* && -f /etc/os-release ]]; then
+    [[ ! -f "${STATE_DIR}/os-release.bak" ]] && cp -a /etc/os-release "${STATE_DIR}/os-release.bak"
+    if grep -q '^PRETTY_NAME=' /etc/os-release; then
+      sed -i "s|^PRETTY_NAME=.*|PRETTY_NAME=\"Astra Linux ${tag}\"|" /etc/os-release
+    else
+      echo "PRETTY_NAME=\"Astra Linux ${tag}\"" >> /etc/os-release
+    fi
+    desc="$(lsb_release -d 2>/dev/null || true)"
+  fi
+  log "Для preinst SN выставлен lsb_release -d: $desc"
+}
+
 #------------------------------------------------------------------------------
 install_sn_package() {
   local cur; cur="$(uname -r)"
@@ -1624,16 +1672,29 @@ $PKG_KERNELS"
 
   case "$OS_ID" in
     astra)
-      if ! DEBIAN_FRONTEND=noninteractive apt-get install -y "$sn_abs"; then
-        log "apt-get install deb не удался — apt-get -f и повтор"
-        DEBIAN_FRONTEND=noninteractive apt-get install -y -f || true
-        ensure_sn_dependencies
-        DEBIAN_FRONTEND=noninteractive apt-get install -y "$sn_abs" \
-          || DEBIAN_FRONTEND=noninteractive dpkg -i "$sn_abs" \
-          || die "Не удалось установить SN deb. Смотрите: dpkg-deb -f $sn_abs Depends"
-        DEBIAN_FRONTEND=noninteractive apt-get install -y -f || true
+      astra_align_lsb_for_sn
+      log "dpkg -i $sn_abs (ядро $cur, lsb: $(lsb_release -d 2>/dev/null || true))"
+      # Сначала dpkg: apt install локального deb тащит лишнее и тонет в сломанных deps.
+      if ! DEBIAN_FRONTEND=noninteractive dpkg -i "$sn_abs"; then
+        log "dpkg -i не до конца — добираем Depends через apt-get -f"
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -f \
+          -o Dpkg::Options::="--force-confdef" \
+          -o Dpkg::Options::="--force-confold" || true
+        DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true
+        DEBIAN_FRONTEND=noninteractive dpkg -i "$sn_abs" || true
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -f \
+          -o Dpkg::Options::="--force-confdef" \
+          -o Dpkg::Options::="--force-confold" || true
       fi
-      dpkg -l secretnet 2>/dev/null | grep -qE '^ii' || die "Пакет secretnet не установился"
+      if ! dpkg -l secretnet 2>/dev/null | grep -qE '^ii'; then
+        die "Пакет secretnet не установился.
+Ядро: $(uname -r)
+lsb_release -d: $(lsb_release -d 2>/dev/null || echo нет)
+preinst SN требует в этой строке «1.6» или «2.12» и точное имя ядра из матрицы.
+Хвост dpkg:
+$(dpkg -l secretnet 2>/dev/null || true)
+$(tail -40 /tmp/sn-install.log 2>/dev/null || true)"
+      fi
       log "secretnet установлен: $(dpkg-query -W -f='${Package} ${Version}\n' secretnet 2>/dev/null)"
       ;;
     redos)
