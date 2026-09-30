@@ -54,6 +54,8 @@ FORCE_PHASE=""
 DRY_RUN=0
 PKG_KERNELS=""
 KERNEL_LOCAL_RPM=""   # путь к скачанному/найденному пакету ядра
+ASTRA_EDITION=""      # ce212 | se17 | se18
+OS_ID=""
 
 #------------------------------------------------------------------------------
 log()  { printf '[%s] %s\n' "$(date '+%F %T')" "$*" | tee -a "${LOG_FILE:-/dev/null}" >&2; }
@@ -101,6 +103,7 @@ save_state() {
   cat > "$STATE_FILE" <<EOF
 PHASE=$phase
 OS_ID=${OS_ID:-}
+ASTRA_EDITION=${ASTRA_EDITION:-}
 PKG_DIR=$PKG_DIR
 LICENSE_FILE=${LICENSE_FILE:-}
 SN_PKG=${SN_PKG:-}
@@ -115,7 +118,6 @@ load_state() {
   [[ -f "$STATE_FILE" ]] || return 1
   # shellcheck disable=SC1090
   source "$STATE_FILE"
-  # CLI имеет приоритет, если передали снова
   return 0
 }
 
@@ -137,6 +139,61 @@ do_reboot() {
   exit 0
 }
 
+# Редакция Astra по имени файла пакета SN/ПМЭ
+astra_edition_from_pkg_name() {
+  local n="$1"
+  case "$n" in
+    *astra1.8*|*astra1_8*|*astra18*) printf 'se18\n' ;;
+    *astra1.7*|*astra1_7*|*astra17*) printf 'se17\n' ;;
+    *astra2.12*|*astra2_12*|*astra212*|*orel*) printf 'ce212\n' ;;
+    *astra1.6*|*astra1_6*) printf 'se16\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+# Редакция хоста (не путать с именем пакета SN)
+astra_detect_host_edition() {
+  local blob="" ver="" pretty="" id_like=""
+  [[ -r /etc/os-release ]] && {
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    ver="${VERSION_ID:-}"
+    pretty="${PRETTY_NAME:-}"
+    id_like="${ID_LIKE:-}"
+  }
+  blob="$(printf '%s\n' "$ver" "$pretty" "$(cat /etc/astra_version 2>/dev/null || true)" \
+    "$(cat /etc/astra/build_version 2>/dev/null || true)" \
+    "$(lsb_release -ds 2>/dev/null || true)")"
+  local k; k="$(uname -r 2>/dev/null || true)"
+
+  if echo "$blob" | grep -qiE '(^|[^0-9])1\.8([^0-9]|$)'; then printf 'se18\n'; return 0; fi
+  if echo "$blob" | grep -qiE '(^|[^0-9])1\.7([^0-9]|$)'; then printf 'se17\n'; return 0; fi
+  if echo "$blob" | grep -qiE '(^|[^0-9])2\.12([^0-9]|$)|orel'; then printf 'ce212\n'; return 0; fi
+  if echo "$blob" | grep -qiE '(^|[^0-9])1\.6([^0-9]|$)'; then printf 'se16\n'; return 0; fi
+
+  # эвристика по ядру, если os-release пустой/кривой
+  case "$k" in
+    6.1.*|6.6.*) printf 'se18\n'; return 0 ;;
+    5.15.*|5.10.*|5.4.*)
+      # 5.x бывает и на CE 2.12, и на SE 1.7 — предпочитаем Special Edition в pretty
+      if echo "$pretty $blob" | grep -qi 'Special'; then printf 'se17\n'; else printf 'ce212\n'; fi
+      return 0
+      ;;
+    4.15.*) printf 'se17\n'; return 0 ;;
+  esac
+  return 1
+}
+
+astra_edition_label() {
+  case "${1:-}" in
+    ce212) printf 'Astra CE 2.12 (Orel)' ;;
+    se18)  printf 'Astra SE 1.8' ;;
+    se17)  printf 'Astra SE 1.7' ;;
+    se16)  printf 'Astra SE 1.6' ;;
+    *)     printf 'Astra (неизвестно)' ;;
+  esac
+}
+
 #------------------------------------------------------------------------------
 detect_os() {
   [[ -r /etc/os-release ]] || die "Нет /etc/os-release"
@@ -155,7 +212,15 @@ detect_os() {
     echo "$pretty $name $id" | grep -qiE 'alt' && OS_ID="alt"
   fi
   [[ -n "$OS_ID" ]] || die "Неизвестная ОС: ID=$id NAME=$name. Поддержка: astra / redos / alt"
-  log "ОС: $OS_ID ($pretty), ядро: $(uname -r)"
+  ASTRA_EDITION=""
+  if [[ "$OS_ID" == "astra" ]]; then
+    ASTRA_EDITION="$(astra_detect_host_edition || true)"
+    [[ -n "$ASTRA_EDITION" ]] || die "Не удалось определить редакцию Astra (os-release / astra_version / uname).
+PRETTY_NAME=${pretty:-?} VERSION_ID=${VERSION_ID:-?} uname=$(uname -r)"
+    log "ОС: $OS_ID — $(astra_edition_label "$ASTRA_EDITION") ($pretty), ядро: $(uname -r)"
+  else
+    log "ОС: $OS_ID ($pretty), ядро: $(uname -r)"
+  fi
 }
 
 #------------------------------------------------------------------------------
@@ -171,7 +236,6 @@ find_packages() {
       fw_pat='snlsp-firewall*red*.rpm'
       ;;
     alt)
-      # предпочитаем c10f1
       sn_pat='sn-lsp*alt0.c10f1*.rpm'
       fw_pat='snlsp-firewall*alt0.c10f1*.rpm'
       ;;
@@ -186,12 +250,54 @@ find_packages() {
   fi
 
   [[ ${#_sn[@]} -ge 1 ]] || die "Не найден пакет SN в $PKG_DIR (шаблон: $sn_pat)"
-  SN_PKG="${_sn[-1]}"
-  if [[ $SKIP_FIREWALL -eq 0 ]]; then
-    [[ ${#_fw[@]} -ge 1 ]] || die "Не найден пакет ПМЭ (firewall) в $PKG_DIR"
-    FW_PKG="${_fw[-1]}"
+
+  # Astra: берём deb под редакцию ХОСТА, а не «последний файл в каталоге»
+  if [[ "$OS_ID" == "astra" ]]; then
+    local f ed matched_sn=() matched_fw=() have_eds=()
+    for f in "${_sn[@]}"; do
+      ed="$(astra_edition_from_pkg_name "$(basename "$f")" || true)"
+      [[ -n "$ed" ]] && have_eds+=("$ed")
+      if [[ -n "$ASTRA_EDITION" && "$ed" == "$ASTRA_EDITION" ]]; then
+        matched_sn+=("$f")
+      fi
+    done
+    for f in "${_fw[@]}"; do
+      ed="$(astra_edition_from_pkg_name "$(basename "$f")" || true)"
+      if [[ -n "$ASTRA_EDITION" && "$ed" == "$ASTRA_EDITION" ]]; then
+        matched_fw+=("$f")
+      fi
+    done
+    if ((${#matched_sn[@]} == 0)); then
+      local need_tag="?"
+      case "$ASTRA_EDITION" in
+        ce212) need_tag="2.12" ;;
+        se18)  need_tag="1.8" ;;
+        se17)  need_tag="1.7" ;;
+        se16)  need_tag="1.6" ;;
+      esac
+      die "На хосте $(astra_edition_label "$ASTRA_EDITION") (ядро $(uname -r)), а в $PKG_DIR нет пакета SN под эту редакцию.
+Найдены: $(printf '%s ' "${_sn[@]##*/}")
+Нужны: sn-lsp_*astra${need_tag}*.deb и snlsp-firewall_*astra${need_tag}*.deb
+Нельзя ставить SN для CE 2.12 на SE 1.8 и наоборот — матрица ядер и preinst разные."
+    fi
+    SN_PKG="${matched_sn[-1]}"
+    if [[ $SKIP_FIREWALL -eq 0 ]]; then
+      if ((${#matched_fw[@]} == 0)); then
+        die "Нет ПМЭ под $(astra_edition_label "$ASTRA_EDITION") в $PKG_DIR.
+Есть: $(printf '%s ' "${_fw[@]##*/}")"
+      fi
+      FW_PKG="${matched_fw[-1]}"
+    else
+      FW_PKG=""
+    fi
   else
-    FW_PKG=""
+    SN_PKG="${_sn[-1]}"
+    if [[ $SKIP_FIREWALL -eq 0 ]]; then
+      [[ ${#_fw[@]} -ge 1 ]] || die "Не найден пакет ПМЭ (firewall) в $PKG_DIR"
+      FW_PKG="${_fw[-1]}"
+    else
+      FW_PKG=""
+    fi
   fi
   log "Пакет SN: $SN_PKG"
   [[ -n "$FW_PKG" ]] && log "Пакет ПМЭ: $FW_PKG"
@@ -355,15 +461,84 @@ astra_install_parsec_for_kernel() {
   return 1
 }
 
-# Автовыбор ядра на Astra CE: достаточно linux-image из матрицы (PARSEC внутри)
+# Скачать linux-image-<kver> напрямую с зеркала редакции (если apt-cache пуст)
+astra_download_linux_image() {
+  local kver="$1" edition="${ASTRA_EDITION:-ce212}"
+  local cache="${KERNEL_CACHE_DIR:-/var/lib/sn-lsp-autoinstall/kernel-cache}"
+  local pkg="linux-image-${kver}" out="${cache}/${pkg}.deb"
+  mkdir -p "$cache"
+  if [[ -f "$out" && -s "$out" ]]; then
+    printf '%s\n' "$out"
+    return 0
+  fi
+
+  local bases=() idx paths host
+  case "$edition" in
+    ce212)
+      bases=(
+        "https://dl.astralinux.ru/astra/stable/2.12_x86-64/repository"
+        "https://download.astralinux.ru/astra/stable/2.12_x86-64/repository"
+        "https://dl.astralinux.ru/astra/stable/2.12_x86-64/repository-base"
+        "https://dl.astralinux.ru/astra/stable/2.12_x86-64/repository-extended"
+      )
+      idx="dists/orel/main/binary-amd64/Packages.gz"
+      ;;
+    se17)
+      bases=(
+        "https://dl.astralinux.ru/astra/stable/1.7_x86-64/repository-main"
+        "https://dl.astralinux.ru/astra/stable/1.7_x86-64/repository-base"
+        "https://download.astralinux.ru/astra/stable/1.7_x86-64/repository-main"
+      )
+      idx="dists/1.7_x86-64/main/binary-amd64/Packages.gz"
+      ;;
+    se18)
+      bases=(
+        "https://dl.astralinux.ru/astra/stable/1.8_x86-64/repository-main"
+        "https://dl.astralinux.ru/astra/stable/1.8_x86-64/repository-extended"
+        "https://download.astralinux.ru/astra/stable/1.8_x86-64/repository-main"
+      )
+      idx="dists/1.8_x86-64/main/binary-amd64/Packages.gz"
+      ;;
+    *)
+      log "WARN: нет URL-шаблона для скачивания ядер edition=$edition"
+      return 1
+      ;;
+  esac
+
+  local base fn tmp
+  tmp="$(mktemp)"
+  for base in "${bases[@]}"; do
+    log "Ищем $pkg в $base ..."
+    if ! curl -fsSL --connect-timeout 20 --max-time 120 -o "$tmp" "${base}/${idx}"; then
+      continue
+    fi
+    fn="$(gzip -dc "$tmp" 2>/dev/null | awk -v p="$pkg" '
+      $1=="Package:" && $2==p {ok=1}
+      ok && $1=="Filename:" {print $2; exit}
+    ' || true)"
+    [[ -n "$fn" ]] || continue
+    log "Качаем ${base}/${fn}"
+    if curl -fsSL --connect-timeout 20 --max-time 600 -o "$out.part" "${base}/${fn}"; then
+      mv -f "$out.part" "$out"
+      rm -f "$tmp"
+      printf '%s\n' "$out"
+      return 0
+    fi
+    rm -f "$out.part"
+  done
+  rm -f "$tmp"
+  return 1
+}
+
+# Автовыбор ядра на Astra: репо редакции → apt → прямое скачивание deb
 ensure_kernel_astra() {
-  local k img target
-  local -a ready=() installable=()
+  local k img target deb
+  local -a ready=() installable=() downloadable=()
 
   ensure_repos_astra
   apt-get update -y || true
 
-  log "Скан матрицы SN (CE: PARSEC вшит в linux-image, отдельный пакет не требуется)..."
+  log "Скан матрицы SN для $(astra_edition_label "${ASTRA_EDITION:-}") (PARSEC: модуль или builtin)..."
   while IFS= read -r k; do
     [[ -z "$k" ]] && continue
     img=""
@@ -376,15 +551,16 @@ ensure_kernel_astra() {
       log "  [поставим] $k"
       installable+=("$k")
     elif [[ -e "/boot/vmlinuz-$k" ]]; then
-      # часто после кривой установки нет config — переустановим image если есть в apt
-      if apt-cache show "linux-image-$k" &>/dev/null; then
+      if [[ -n "$img" ]] || apt-cache show "linux-image-$k" &>/dev/null; then
         log "  [починим]  $k"
         installable+=("$k")
       else
-        log "  [пропуск]  $k — битый /boot без пакета в apt"
+        log "  [скачаем?] $k — в /boot есть, в apt нет"
+        downloadable+=("$k")
       fi
     else
-      log "  [пропуск]  $k — нет в apt"
+      log "  [нет apt]  $k — попробуем прямую загрузку"
+      downloadable+=("$k")
     fi
   done <<< "$(printf '%s\n' "$PKG_KERNELS" | sort -V -r)"
 
@@ -398,13 +574,33 @@ ensure_kernel_astra() {
 
   if ((${#installable[@]} > 0)); then
     target="$(astra_prefer_generic "${installable[@]}")"
-    log "Ставим $target автоматически"
+    log "Ставим $target из apt"
     activate_kernel_astra "$target" "dnf" "linux-image-${target}" || return 1
     do_reboot 1
   fi
 
-  log "ERROR: в apt нет linux-image из матрицы SN для этой Astra"
-  return 1
+  # Fallback: скачать generic из матрицы напрямую
+  local prefer=()
+  while IFS= read -r k; do
+    [[ "$k" == *generic* ]] && prefer+=("$k")
+  done <<< "$(printf '%s\n' "${downloadable[@]}" | sort -V -r)"
+  ((${#prefer[@]} == 0)) && prefer=("${downloadable[@]}")
+
+  for k in "${prefer[@]}"; do
+    [[ -z "$k" ]] && continue
+    log "Прямое скачивание linux-image-$k с зеркала $(astra_edition_label "${ASTRA_EDITION:-}")..."
+    deb="$(astra_download_linux_image "$k" || true)"
+    if [[ -n "$deb" && -f "$deb" ]]; then
+      log "Ставим из файла: $deb"
+      activate_kernel_astra "$k" "file" "$deb" || continue
+      do_reboot 1
+    fi
+  done
+
+  die "Не удалось получить linux-image из матрицы SN для $(astra_edition_label "${ASTRA_EDITION:-}").
+Хост: $(uname -r), пакет: $(basename "${SN_PKG:-?}").
+В apt нет ядер матрицы, прямая загрузка тоже не удалась (сеть / зеркало / нет пакета под редакцию).
+Проверьте: cat /etc/apt/sources.list.d/sn-auto-astra.list && apt-cache search linux-image-5.10"
 }
 
 # Astra/Debian: initrd с MODULES=most + драйверы диска с текущей системы
@@ -803,34 +999,18 @@ ensure_repos_astra() {
   [[ $SKIP_REPOS -eq 1 ]] && return 0
   log "Astra: проверка/подключение репозиториев apt"
 
-  mkdir -p /etc/apt/sources.list.d
+  mkdir -p /etc/apt/sources.list.d /etc/apt/preferences.d
 
-  # Версия: из пакета SN → os-release / astra_version
-  local edition="ce212"  # ce212 | se17 | se18
-  if [[ "${SN_PKG:-}" == *astra1.7* || "${SN_PKG:-}" == *astra1_7* ]]; then
-    edition="se17"
-  elif [[ "${SN_PKG:-}" == *astra1.8* || "${SN_PKG:-}" == *astra1_8* ]]; then
-    edition="se18"
-  elif [[ "${SN_PKG:-}" == *astra2.12* || "${SN_PKG:-}" == *astra2_12* ]]; then
-    edition="ce212"
-  else
-    local ver=""
-    ver="$(cat /etc/astra_version 2>/dev/null || true)"
-    [[ -z "$ver" ]] && ver="$(. /etc/os-release 2>/dev/null; echo "${VERSION_ID:-}")"
-    case "$ver" in
-      1.7*|1_7*) edition="se17" ;;
-      1.8*|1_8*) edition="se18" ;;
-      2.12*|2_12*|orel*) edition="ce212" ;;
-    esac
-    # PRETTY_NAME подсказка
-    if grep -qi 'Special Edition' /etc/os-release 2>/dev/null; then
-      grep -qE '1\.8' /etc/os-release 2>/dev/null && edition="se18"
-      grep -qE '1\.7' /etc/os-release 2>/dev/null && edition="se17"
-    fi
+  local edition="${ASTRA_EDITION:-}"
+  if [[ -z "$edition" && -n "${SN_PKG:-}" ]]; then
+    edition="$(astra_edition_from_pkg_name "$(basename "$SN_PKG")" || true)"
   fi
-  log "Astra edition для репозиториев: $edition"
+  [[ -z "$edition" ]] && edition="$(astra_detect_host_edition || true)"
+  [[ -n "$edition" ]] || die "Не удалось выбрать редакцию Astra для репозиториев"
+  ASTRA_EDITION="$edition"
+  log "Astra edition для репозиториев: $edition ($(astra_edition_label "$edition"))"
 
-  # cdrom: без диска ломает apt update — комментируем
+  # cdrom без диска ломает apt update
   local f
   for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
     [[ -f "$f" ]] || continue
@@ -841,16 +1021,39 @@ ensure_repos_astra() {
     fi
   done
 
-  # Живые http(s) источники (не cdrom, не комментарии)
-  local live=0
-  live="$(grep -hE '^[[:space:]]*deb(-src)?[[:space:]]+' \
-    /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null \
-    | grep -v sn-auto-astra \
-    | grep -vE 'cdrom:|^[[:space:]]*#' \
-    | grep -cE 'https?://' || true)"
-  live="${live:-0}"
+  # Чужие редакции в sources мешают (ядра 2.12 не видны за 1.8 и наоборот)
+  astra_disable_foreign_sources() {
+    local want="$1" f line
+    for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+      [[ -f "$f" ]] || continue
+      [[ "$(basename "$f")" == "sn-auto-astra.list" ]] && continue
+      case "$want" in
+        ce212)
+          if grep -qE '^[[:space:]]*deb.*(1\.7_x86-64|1\.8_x86-64|/1\.7/|/1\.8/)' "$f" 2>/dev/null; then
+            cp -a "$f" "${f}.bak-sn-auto" 2>/dev/null || true
+            sed -i -E '/^[[:space:]]*deb.*(1\.7_x86-64|1\.8_x86-64|\/1\.7\/|\/1\.8\/)/s/^/# sn-auto-foreign /' "$f"
+            log "Отключены чужие (1.7/1.8) источники в $f"
+          fi
+          ;;
+        se17)
+          if grep -qE '^[[:space:]]*deb.*(2\.12_x86-64|/orel|1\.8_x86-64|/1\.8/)' "$f" 2>/dev/null; then
+            cp -a "$f" "${f}.bak-sn-auto" 2>/dev/null || true
+            sed -i -E '/^[[:space:]]*deb.*(2\.12_x86-64|\/orel|1\.8_x86-64|\/1\.8\/)/s/^/# sn-auto-foreign /' "$f"
+            log "Отключены чужие (2.12/1.8) источники в $f"
+          fi
+          ;;
+        se18)
+          if grep -qE '^[[:space:]]*deb.*(2\.12_x86-64|/orel|1\.7_x86-64|/1\.7/)' "$f" 2>/dev/null; then
+            cp -a "$f" "${f}.bak-sn-auto" 2>/dev/null || true
+            sed -i -E '/^[[:space:]]*deb.*(2\.12_x86-64|\/orel|1\.7_x86-64|\/1\.7\/)/s/^/# sn-auto-foreign /' "$f"
+            log "Отключены чужие (2.12/1.7) источники в $f"
+          fi
+          ;;
+      esac
+    done
+  }
+  astra_disable_foreign_sources "$edition"
 
-  # HTTPS для зеркал Astra
   DEBIAN_FRONTEND=noninteractive apt-get install -y apt-transport-https ca-certificates 2>/dev/null || true
 
   write_astra_sources() {
@@ -859,114 +1062,113 @@ ensure_repos_astra() {
       ce212)
         cat > /etc/apt/sources.list.d/sn-auto-astra.list <<EOF
 # Auto by install_sn_lsp.sh — Astra CE 2.12 (Orel), host=$host
-deb https://${host}/astra/stable/2.12_x86-64/repository/ orel main contrib non-free
-deb https://${host}/astra/stable/2.12_x86-64/repository-base/ orel main contrib non-free
-deb https://${host}/astra/stable/2.12_x86-64/repository-extended/ orel main contrib non-free
+deb [trusted=yes] https://${host}/astra/stable/2.12_x86-64/repository/ orel main contrib non-free
+deb [trusted=yes] https://${host}/astra/stable/2.12_x86-64/repository-base/ orel main contrib non-free
+deb [trusted=yes] https://${host}/astra/stable/2.12_x86-64/repository-extended/ orel main contrib non-free
 EOF
         ;;
       se17)
         cat > /etc/apt/sources.list.d/sn-auto-astra.list <<EOF
 # Auto by install_sn_lsp.sh — Astra SE 1.7, host=$host
-deb https://${host}/astra/stable/1.7_x86-64/repository-main/ 1.7_x86-64 main contrib non-free
-deb https://${host}/astra/stable/1.7_x86-64/repository-update/ 1.7_x86-64 main contrib non-free
-deb https://${host}/astra/stable/1.7_x86-64/repository-base/ 1.7_x86-64 main contrib non-free
-deb https://${host}/astra/stable/1.7_x86-64/repository-extended/ 1.7_x86-64 main contrib non-free
+deb [trusted=yes] https://${host}/astra/stable/1.7_x86-64/repository-main/ 1.7_x86-64 main contrib non-free
+deb [trusted=yes] https://${host}/astra/stable/1.7_x86-64/repository-update/ 1.7_x86-64 main contrib non-free
+deb [trusted=yes] https://${host}/astra/stable/1.7_x86-64/repository-base/ 1.7_x86-64 main contrib non-free
+deb [trusted=yes] https://${host}/astra/stable/1.7_x86-64/repository-extended/ 1.7_x86-64 main contrib non-free
 EOF
         ;;
       se18)
         cat > /etc/apt/sources.list.d/sn-auto-astra.list <<EOF
 # Auto by install_sn_lsp.sh — Astra SE 1.8, host=$host
-deb https://${host}/astra/stable/1.8_x86-64/repository-main/ 1.8_x86-64 main contrib non-free
-deb https://${host}/astra/stable/1.8_x86-64/repository-extended/ 1.8_x86-64 main contrib non-free
+deb [trusted=yes] https://${host}/astra/stable/1.8_x86-64/repository-main/ 1.8_x86-64 main contrib non-free
+deb [trusted=yes] https://${host}/astra/stable/1.8_x86-64/repository-extended/ 1.8_x86-64 main contrib non-free
 EOF
+        ;;
+      *)
+        die "Нет шаблона репозиториев для edition=$edition"
         ;;
     esac
   }
 
-  astra_apt_ok() {
-    local logf=/tmp/sn-apt-update-astra.log
-    apt-get update >"$logf" 2>&1
-    local rc=$?
-    tail -15 "$logf" | sed 's/^/  /' || true
-    if grep -qiE 'could not be read|Malformed|NO_PUBKEY' "$logf"; then
-      # NO_PUBKEY часто всё же даёт частичный индекс — не сразу fail
-      :
-    fi
-    if [[ $rc -ne 0 ]] && ! grep -qiE 'Get:|Hit:|Fetched' "$logf"; then
-      return 1
-    fi
-    # Проверка что deps SN видны (типичные для astra2.12)
-    if apt-cache show libmhash2 &>/dev/null || apt-cache show sudo &>/dev/null; then
-      return 0
-    fi
-    return 1
+  # Сколько ядер из матрицы SN видно в apt прямо сейчас
+  astra_matrix_in_apt_count() {
+    local k n=0
+    [[ -n "${PKG_KERNELS:-}" ]] || { printf '0\n'; return 0; }
+    while IFS= read -r k; do
+      [[ -z "$k" ]] && continue
+      apt-cache show "linux-image-$k" &>/dev/null && n=$((n + 1))
+    done <<< "$PKG_KERNELS"
+    printf '%s\n' "$n"
   }
 
-  local need_write=0
-  if [[ "$live" -eq 0 ]]; then
-    log "Сетевых deb-источников нет (пусто / примеры / только cdrom) — подключим зеркала"
-    need_write=1
-  elif ! apt-get update >/tmp/sn-apt-update-astra.log 2>&1; then
-    log "apt-get update с текущими sources неуспешен — добавим зеркала Astra"
-    need_write=1
-  elif ! apt-cache show libmhash2 &>/dev/null && ! apt-cache show sudo &>/dev/null; then
-    log "Текущие репо не отдают базовые пакеты — добавим зеркала Astra"
-    need_write=1
-  else
-    log "Живых сетевых источников: $live — базовые пакеты уже видны"
-  fi
-
-  if [[ $need_write -eq 1 ]]; then
-    local hosts=(
-      "dl.astralinux.ru"
-      "download.astralinux.ru"
-    )
-    local h ok=0
-    for h in "${hosts[@]}"; do
-      log "Пробуем зеркало Astra: $h ($edition)"
-      write_astra_sources "$h"
-      if astra_apt_ok; then
-        log "Репозиторий Astra OK: $h"
-        ok=1
-        break
-      fi
-    done
-    if [[ $ok -ne 1 ]]; then
-      log "WARN: зеркала не подтвердили пакеты — пишем multi-host list"
-      case "$edition" in
-        ce212)
-          cat > /etc/apt/sources.list.d/sn-auto-astra.list <<'EOF'
-# Auto by install_sn_lsp.sh — Astra CE 2.12 multi-host
-deb https://dl.astralinux.ru/astra/stable/2.12_x86-64/repository/ orel main contrib non-free
-deb https://download.astralinux.ru/astra/stable/2.12_x86-64/repository/ orel main contrib non-free
-EOF
-          ;;
-        se17)
-          cat > /etc/apt/sources.list.d/sn-auto-astra.list <<'EOF'
-# Auto by install_sn_lsp.sh — Astra SE 1.7 multi-host
-deb https://dl.astralinux.ru/astra/stable/1.7_x86-64/repository-main/ 1.7_x86-64 main contrib non-free
-deb https://dl.astralinux.ru/astra/stable/1.7_x86-64/repository-update/ 1.7_x86-64 main contrib non-free
-deb https://dl.astralinux.ru/astra/stable/1.7_x86-64/repository-base/ 1.7_x86-64 main contrib non-free
-deb https://dl.astralinux.ru/astra/stable/1.7_x86-64/repository-extended/ 1.7_x86-64 main contrib non-free
-deb https://download.astralinux.ru/astra/stable/1.7_x86-64/repository-main/ 1.7_x86-64 main contrib non-free
-deb https://download.astralinux.ru/astra/stable/1.7_x86-64/repository-base/ 1.7_x86-64 main contrib non-free
-EOF
-          ;;
-        se18)
-          cat > /etc/apt/sources.list.d/sn-auto-astra.list <<'EOF'
-# Auto by install_sn_lsp.sh — Astra SE 1.8 multi-host
-deb https://dl.astralinux.ru/astra/stable/1.8_x86-64/repository-main/ 1.8_x86-64 main contrib non-free
-deb https://dl.astralinux.ru/astra/stable/1.8_x86-64/repository-extended/ 1.8_x86-64 main contrib non-free
-deb https://download.astralinux.ru/astra/stable/1.8_x86-64/repository-main/ 1.8_x86-64 main contrib non-free
-EOF
-          ;;
-      esac
-      apt-get update 2>&1 | tail -12 || true
+  astra_apt_ok() {
+    local logf=/tmp/sn-apt-update-astra.log need_matrix="${1:-0}"
+    apt-get update >"$logf" 2>&1 || true
+    tail -12 "$logf" | sed 's/^/  /' || true
+    if ! grep -qiE 'Get:|Hit:|Fetched|Reading package lists' "$logf"; then
+      return 1
     fi
+    if ! apt-cache show sudo &>/dev/null && ! apt-cache show libmhash2 &>/dev/null; then
+      return 1
+    fi
+    if [[ "$need_matrix" == "1" && -n "${PKG_KERNELS:-}" ]]; then
+      local n; n="$(astra_matrix_in_apt_count)"
+      log "Ядер матрицы SN видно в apt: $n"
+      [[ "$n" -ge 1 ]] || return 1
+    fi
+    return 0
+  }
+
+  # ВСЕГДА пишем sn-auto-astra.list нужной редакции (раньше пропускали, если «живые» 1.8 уже были)
+  local hosts=( "dl.astralinux.ru" "download.astralinux.ru" )
+  local h ok=0 need_m=0
+  [[ -n "${PKG_KERNELS:-}" ]] && need_m=1
+  for h in "${hosts[@]}"; do
+    log "Подключаем зеркало Astra: $h ($edition), проверка матрицы ядер=$need_m"
+    write_astra_sources "$h"
+    if astra_apt_ok "$need_m"; then
+      log "Репозиторий Astra OK: $h"
+      ok=1
+      break
+    fi
+  done
+  if [[ $ok -ne 1 ]]; then
+    log "WARN: одиночные зеркала не подтвердили матрицу — multi-host list"
+    case "$edition" in
+      ce212)
+        cat > /etc/apt/sources.list.d/sn-auto-astra.list <<'EOF'
+# Auto by install_sn_lsp.sh — Astra CE 2.12 multi-host
+deb [trusted=yes] https://dl.astralinux.ru/astra/stable/2.12_x86-64/repository/ orel main contrib non-free
+deb [trusted=yes] https://download.astralinux.ru/astra/stable/2.12_x86-64/repository/ orel main contrib non-free
+deb [trusted=yes] https://dl.astralinux.ru/astra/stable/2.12_x86-64/repository-base/ orel main contrib non-free
+deb [trusted=yes] https://dl.astralinux.ru/astra/stable/2.12_x86-64/repository-extended/ orel main contrib non-free
+EOF
+        ;;
+      se17)
+        cat > /etc/apt/sources.list.d/sn-auto-astra.list <<'EOF'
+# Auto by install_sn_lsp.sh — Astra SE 1.7 multi-host
+deb [trusted=yes] https://dl.astralinux.ru/astra/stable/1.7_x86-64/repository-main/ 1.7_x86-64 main contrib non-free
+deb [trusted=yes] https://dl.astralinux.ru/astra/stable/1.7_x86-64/repository-base/ 1.7_x86-64 main contrib non-free
+deb [trusted=yes] https://download.astralinux.ru/astra/stable/1.7_x86-64/repository-main/ 1.7_x86-64 main contrib non-free
+EOF
+        ;;
+      se18)
+        cat > /etc/apt/sources.list.d/sn-auto-astra.list <<'EOF'
+# Auto by install_sn_lsp.sh — Astra SE 1.8 multi-host
+deb [trusted=yes] https://dl.astralinux.ru/astra/stable/1.8_x86-64/repository-main/ 1.8_x86-64 main contrib non-free
+deb [trusted=yes] https://dl.astralinux.ru/astra/stable/1.8_x86-64/repository-extended/ 1.8_x86-64 main contrib non-free
+deb [trusted=yes] https://download.astralinux.ru/astra/stable/1.8_x86-64/repository-main/ 1.8_x86-64 main contrib non-free
+EOF
+        ;;
+    esac
+    apt-get update 2>&1 | tail -12 || true
   fi
 
-  log "Итоговый sn-auto-astra.list (если есть):"
-  [[ -f /etc/apt/sources.list.d/sn-auto-astra.list ]] && sed 's/^/  /' /etc/apt/sources.list.d/sn-auto-astra.list || log "  (используются штатные sources)"
+  log "Итоговый sn-auto-astra.list:"
+  [[ -f /etc/apt/sources.list.d/sn-auto-astra.list ]] && sed 's/^/  /' /etc/apt/sources.list.d/sn-auto-astra.list \
+    || log "  (нет файла)"
+  if [[ -n "${PKG_KERNELS:-}" ]]; then
+    log "Матрица SN в apt после настройки: $(astra_matrix_in_apt_count) ядер"
+  fi
 }
 
 ensure_repos_alt() {
@@ -1469,26 +1671,35 @@ activate_kernel_astra() {
 
   apt-get update -y || true
 
-  # linux-image (+ parsec-пакет только если он реально есть в apt; на CE его обычно нет)
   local parsec_pkg=""
   parsec_pkg="$(astra_find_parsec_pkg "$kver" || true)"
-  local apt_pkgs=()
-  apt_pkgs+=("$ref")
-  [[ -n "$parsec_pkg" ]] && apt_pkgs+=("$parsec_pkg")
 
   if [[ ! -e "/boot/vmlinuz-$kver" ]]; then
-    log "apt install: ${apt_pkgs[*]}"
-    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y --install-recommends \
+    if [[ "$method" == "file" || "$ref" == *.deb ]]; then
+      log "dpkg -i локального ядра: $ref"
+      DEBIAN_FRONTEND=noninteractive dpkg -i "$ref" || true
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -f \
+        -o Dpkg::Options::="--force-confdef" \
+        -o Dpkg::Options::="--force-confold" || true
+      if [[ -n "$parsec_pkg" ]]; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --install-recommends "$parsec_pkg" || true
+      fi
+    else
+      local apt_pkgs=("$ref")
+      [[ -n "$parsec_pkg" ]] && apt_pkgs+=("$parsec_pkg")
+      log "apt install: ${apt_pkgs[*]}"
+      if ! DEBIAN_FRONTEND=noninteractive apt-get install -y --install-recommends \
+            -o Dpkg::Options::="--force-confdef" \
+            -o Dpkg::Options::="--force-confold" \
+            "${apt_pkgs[@]}"; then
+        log "apt install ядра вернул ошибку — dpkg --configure / apt -f / reinstall"
+        DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true
+        DEBIAN_FRONTEND=noninteractive apt-get -f install -y || true
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --install-recommends --reinstall \
           -o Dpkg::Options::="--force-confdef" \
           -o Dpkg::Options::="--force-confold" \
-          "${apt_pkgs[@]}"; then
-      log "apt install ядра вернул ошибку — dpkg --configure / apt -f / reinstall"
-      DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true
-      DEBIAN_FRONTEND=noninteractive apt-get -f install -y || true
-      DEBIAN_FRONTEND=noninteractive apt-get install -y --install-recommends --reinstall \
-        -o Dpkg::Options::="--force-confdef" \
-        -o Dpkg::Options::="--force-confold" \
-        "${apt_pkgs[@]}" || true
+          "${apt_pkgs[@]}" || true
+      fi
     fi
   else
     log "vmlinuz-$kver уже есть — дотягиваем PARSEC и чиним initrd/GRUB"
