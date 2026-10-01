@@ -27,16 +27,54 @@ def main() -> int:
         "host",
         "groups",
         "sn_os",
+        "os_flavor",
+        "pkg_family",
+        "install_supported",
         "os_pretty",
         "kernel",
         "kernel_in_matrix",
+        "kernels_boot",
         "disk_root_free_gb",
+        "disk_boot_free_gb",
         "mem_mb",
         "repos_ok",
+        "parsec",
         "sn_installed",
+        "sn_packages",
+        "sn_services",
         "phase",
         "ready",
         "notes",
+    ]
+    detail_fields = [
+        ("Хост", "host"),
+        ("Группы", "groups"),
+        ("ОС", "sn_os"),
+        ("Редакция/версия", "os_flavor"),
+        ("Семейство пакетов", "pkg_family"),
+        ("Установщик SN", "install_supported"),
+        ("Описание", "os_pretty"),
+        ("lsb", "lsb_description"),
+        ("Ядро", "kernel"),
+        ("Ядро в матрице SN", "kernel_in_matrix"),
+        ("Ядра в /boot", "kernels_boot"),
+        ("Свободно / ГБ", "disk_root_free_gb"),
+        ("Свободно /boot ГБ", "disk_boot_free_gb"),
+        ("RAM МБ", "mem_mb"),
+        ("Вирт.", "virt"),
+        ("IP", "ips"),
+        ("Репозитории", "repos_ok"),
+        ("Строки репозиториев", "repos_sample"),
+        ("PARSEC", "parsec"),
+        ("SELinux", "selinux"),
+        ("SN установлен", "sn_installed"),
+        ("Пакеты SN", "sn_packages"),
+        ("Модули sn*", "sn_modules"),
+        ("Службы", "sn_services"),
+        ("Лицензия", "license_summary"),
+        ("PHASE", "phase"),
+        ("Готов к установке", "ready"),
+        ("Заметки", "notes"),
     ]
     ready: list[str] = []
     blocked: list[str] = []
@@ -57,6 +95,18 @@ def main() -> int:
     (out / "blocked.txt").write_text(
         "\n".join(blocked) + ("\n" if blocked else ""), encoding="utf-8"
     )
+
+    blocks: list[str] = []
+    for r in sorted(rows, key=lambda x: x.get("host", "")):
+        lines = [f"== {r.get('host', '?')} =="]
+        for title, key in detail_fields:
+            val = r.get(key, "")
+            if val in (None, ""):
+                continue
+            lines.append(f"{title}: {val}")
+        blocks.append("\n".join(lines))
+    (out / "detail.txt").write_text("\n\n".join(blocks) + ("\n" if blocks else ""), encoding="utf-8")
+
     print(str(out))
     print(f"ready={len(ready)} blocked={len(blocked)}")
     return 0

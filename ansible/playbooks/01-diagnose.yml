@@ -1,5 +1,6 @@
 ---
-# Диагностика парка: факты → reports/<timestamp>/summary.csv + ready.txt / blocked.txt
+# Диагностика парка: факты → reports/<timestamp>/
+#   summary.csv, hosts.json, detail.txt, ready.txt, blocked.txt
 #
 #   cd ansible
 #   cp inventory/hosts.example.ini inventory/hosts.ini   # заполнить
@@ -35,22 +36,43 @@
         set -e
         MAP_FILE="{{ sn_reports_dir }}/.matrix_{{ sn_report_stamp }}.txt"
         : > "$MAP_FILE"
+        edition_of() {
+          local b
+          b="$(basename "$1")"
+          case "$b" in
+            *astra1.8*|*astra1_8*) echo se18 ;;
+            *astra1.7*|*astra1_7*) echo se17 ;;
+            *astra2.12*|*astra2_12*|*orel*) echo ce212 ;;
+            *astra1.6*|*astra1_6*) echo se16 ;;
+            *) echo default ;;
+          esac
+        }
         list_k() {
           local os="$1" dir="$2"
-          local pkg
-          pkg="$(find "$dir" -maxdepth 1 \( -name 'sn-lsp_*.deb' -o -name 'sn-lsp*.rpm' \) ! -name '*firewall*' 2>/dev/null | head -n1)"
-          if [[ -z "$pkg" ]]; then
-            echo "${os}|__none__" >> "$MAP_FILE"
+          local pkg ed k found=0
+          if [[ ! -d "$dir" ]]; then
+            echo "${os}|default|__none__" >> "$MAP_FILE"
             return
           fi
-          bash "{{ playbook_dir }}/../roles/sn_diagnose/files/list_kernels.sh" "$pkg" | while read -r k; do
-            [[ -n "$k" ]] && echo "${os}|${k}" >> "$MAP_FILE"
-          done
+          while IFS= read -r pkg; do
+            [[ -z "$pkg" ]] && continue
+            found=1
+            ed="$(edition_of "$pkg")"
+            echo "${os}|${ed}|__pkg__|$(basename "$pkg")" >> "$MAP_FILE"
+            while IFS= read -r k; do
+              [[ -n "$k" ]] && echo "${os}|${ed}|${k}" >> "$MAP_FILE"
+            done < <(bash "{{ playbook_dir }}/../roles/sn_diagnose/files/list_kernels.sh" "$pkg")
+          done < <(find "$dir" -maxdepth 1 \( -name 'sn-lsp_*.deb' -o -name 'sn-lsp*.rpm' -o -name 'sn-lsp-*.rpm' \) ! -name '*firewall*' 2>/dev/null | sort)
+          if [[ "$found" -eq 0 ]]; then
+            echo "${os}|default|__none__" >> "$MAP_FILE"
+          fi
         }
         ROOT="{{ sn_files_root }}"
         list_k astra "$ROOT/packages-astra"
         list_k redos "$ROOT/packages"
         list_k alt "$ROOT/packages-alt"
+        list_k debian "$ROOT/packages-debian"
+        list_k centos "$ROOT/packages-centos"
         cat "$MAP_FILE"
       args:
         executable: /bin/bash
@@ -58,37 +80,16 @@
       changed_when: false
       failed_when: false
 
-    - name: Materialize kernel_in_matrix lookup dict
+    - name: Keep kernel matrix lines (os|edition|kernel)
       ansible.builtin.set_fact:
-        sn_kernel_matrix_map: >-
-          {{
-            {
-              'astra': {},
-              'redos': {},
-              'alt': {}
-            }
-          }}
-
-    - name: Fill matrix map
-      ansible.builtin.set_fact:
-        sn_kernel_matrix_map: >-
-          {{
-            sn_kernel_matrix_map | combine({
-              item.split('|')[0]: (
-                sn_kernel_matrix_map[item.split('|')[0]] | default({})
-                | combine({item.split('|')[1]: 'yes'})
-              )
-            }, recursive=True)
-          }}
-      loop: "{{ (sn_matrix_raw.stdout_lines | default([])) | reject('search', '__none__') | list }}"
-      when: sn_matrix_raw is succeeded and (sn_matrix_raw.stdout_lines | default([]) | length) > 0
+        sn_matrix_lines: "{{ sn_matrix_raw.stdout_lines | default([]) }}"
 
 - name: Collect diagnosis from targets
   hosts: sn_targets
   gather_facts: false
   become: false
   vars:
-    sn_kernel_matrix_map: "{{ hostvars['localhost']['sn_kernel_matrix_map'] | default({'astra': {}, 'redos': {}, 'alt': {}}) }}"
+    sn_matrix_lines: "{{ hostvars['localhost']['sn_matrix_lines'] | default([]) }}"
   roles:
     - role: sn_diagnose
 

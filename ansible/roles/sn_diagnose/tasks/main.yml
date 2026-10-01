@@ -18,19 +18,43 @@
   ansible.builtin.set_fact:
     sn_diag_groups: "{{ group_names | reject('equalto', 'sn_targets') | list | join(',') }}"
 
+- name: Compare running kernel with SN package matrix
+  ansible.builtin.set_fact:
+    sn_diag_kernel_matrix: >-
+      {%- set os = sn_diag_raw.sn_os -%}
+      {%- set ed = sn_diag_raw.astra_edition if os == 'astra' else 'default' -%}
+      {%- set lines = sn_matrix_lines | default([]) -%}
+      {%- set prefix = os ~ '|' ~ ed ~ '|' -%}
+      {%- set mine = lines | select('search', '^' ~ os ~ '\\|' ~ ed ~ '\\|') | list -%}
+      {%- set pkgs = mine | select('search', '\\|__pkg__\\|') | list -%}
+      {%- set kline = prefix ~ sn_diag_raw.kernel -%}
+      {%- if os in ['debian', 'centos'] -%}n/a
+      {%- elif os not in ['astra', 'redos', 'alt'] -%}unknown
+      {%- elif pkgs | length == 0 -%}no_pkg
+      {%- elif kline in lines -%}yes
+      {%- else -%}no
+      {%- endif -%}
+
 - name: Evaluate ready / notes
   ansible.builtin.set_fact:
     sn_diag_ready: >-
       {{
-        (sn_diag_raw.sn_os in ['astra', 'redos', 'alt'])
+        (sn_diag_raw.install_supported | default('no') == 'yes')
         and ((sn_diag_raw.disk_root_free_gb | float) >= (sn_min_free_gb | float))
       }}
     sn_diag_notes: >-
       {{
         (
-          ([] if sn_diag_raw.sn_os in ['astra', 'redos', 'alt'] else ['unsupported_os'])
+          ([] if sn_diag_raw.sn_os != 'unknown' else ['unsupported_os'])
+          +
+          (['no_installer'] if sn_diag_raw.install_supported | default('no') != 'yes' and sn_diag_raw.sn_os != 'unknown' else [])
           +
           ([] if (sn_diag_raw.disk_root_free_gb | float) >= (sn_min_free_gb | float) else ['low_disk'])
+          +
+          (['low_boot'] if (
+              sn_diag_raw.boot_separate == 'yes'
+              and (sn_diag_raw.disk_boot_free_gb | default('0') | float) < 0.2
+            ) else [])
           +
           (['repos_empty'] if sn_diag_raw.repos_ok == 'no' else [])
           +
@@ -38,6 +62,22 @@
           +
           (['install_in_progress_phase_' ~ sn_diag_raw.phase]
              if sn_diag_raw.phase not in ['', '5', none] else [])
+          +
+          (['no_sn_package_for_edition'] if sn_diag_kernel_matrix == 'no_pkg' else [])
+          +
+          (['kernel_not_in_matrix'] if sn_diag_kernel_matrix == 'no' else [])
+          +
+          (['parsec_missing'] if sn_diag_raw.sn_os == 'astra' and sn_diag_raw.parsec == 'missing' else [])
+          +
+          (['license_demo'] if 'емонстрац' in (sn_diag_raw.license_summary | default('')) else [])
+          +
+          (['sn_service_down'] if (
+              sn_diag_raw.sn_installed == 'yes'
+              and (
+                '=inactive' in (sn_diag_raw.sn_services | default(''))
+                or '=failed' in (sn_diag_raw.sn_services | default(''))
+              )
+            ) else [])
         ) | join(';')
       }}
 
@@ -47,27 +87,36 @@
       host: "{{ inventory_hostname }}"
       groups: "{{ sn_diag_groups }}"
       sn_os: "{{ sn_diag_raw.sn_os }}"
+      os_flavor: "{{ sn_diag_raw.os_flavor }}"
+      pkg_family: "{{ sn_diag_raw.pkg_family }}"
+      install_supported: "{{ sn_diag_raw.install_supported }}"
       os_pretty: "{{ sn_diag_raw.os_pretty }}"
       os_id_raw: "{{ sn_diag_raw.os_id_raw }}"
       os_version: "{{ sn_diag_raw.os_version }}"
+      lsb_description: "{{ sn_diag_raw.lsb_description }}"
+      astra_edition: "{{ sn_diag_raw.astra_edition }}"
       kernel: "{{ sn_diag_raw.kernel }}"
+      kernels_boot: "{{ sn_diag_raw.kernels_boot }}"
       arch: "{{ sn_diag_raw.arch }}"
+      virt: "{{ sn_diag_raw.virt }}"
       ips: "{{ sn_diag_raw.ips }}"
       mem_mb: "{{ sn_diag_raw.mem_mb }}"
       disk_root_free_gb: "{{ sn_diag_raw.disk_root_free_gb }}"
       disk_boot_free_gb: "{{ sn_diag_raw.disk_boot_free_gb }}"
+      boot_separate: "{{ sn_diag_raw.boot_separate }}"
       selinux: "{{ sn_diag_raw.selinux }}"
       apparmor: "{{ sn_diag_raw.apparmor }}"
+      parsec: "{{ sn_diag_raw.parsec }}"
       repos_ok: "{{ sn_diag_raw.repos_ok }}"
+      repos_sample: "{{ sn_diag_raw.repos_sample }}"
       sn_installed: "{{ sn_diag_raw.sn_installed }}"
       sn_pkg: "{{ sn_diag_raw.sn_pkg }}"
+      sn_packages: "{{ sn_diag_raw.sn_packages }}"
+      sn_modules: "{{ sn_diag_raw.sn_modules }}"
+      sn_services: "{{ sn_diag_raw.sn_services }}"
+      license_summary: "{{ sn_diag_raw.license_summary }}"
+      python3: "{{ sn_diag_raw.python3 }}"
       phase: "{{ sn_diag_raw.phase }}"
       ready: "{{ 'yes' if sn_diag_ready else 'no' }}"
       notes: "{{ sn_diag_notes }}"
-      kernel_in_matrix: >-
-        {%- set m = sn_kernel_matrix_map[sn_diag_raw.sn_os] | default({}) -%}
-        {%- if sn_diag_raw.sn_os not in ['astra', 'redos', 'alt'] -%}unknown
-        {%- elif (m | length) == 0 -%}unknown
-        {%- elif sn_diag_raw.kernel in m -%}yes
-        {%- else -%}no
-        {%- endif -%}
+      kernel_in_matrix: "{{ sn_diag_kernel_matrix }}"
