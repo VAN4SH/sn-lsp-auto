@@ -2010,8 +2010,17 @@ deploy_helper_scripts() {
       src="/opt/sn-lsp-auto/$s"
     fi
     if [[ -n "$src" ]]; then
-      install -m 0755 "$src" "$dest/$s"
-      log "Скрипт: $dest/$s"
+      # ansible запускает уже из /opt/sn-lsp-auto — install одного файла в себя даёт rc=1
+      local src_real dest_real
+      src_real="$(readlink -f "$src" 2>/dev/null || echo "$src")"
+      dest_real="$(readlink -f "$dest/$s" 2>/dev/null || echo "$dest/$s")"
+      if [[ "$src_real" == "$dest_real" ]]; then
+        chmod 0755 "$dest/$s" 2>/dev/null || true
+        log "Скрипт уже на месте: $dest/$s"
+      else
+        install -m 0755 "$src" "$dest/$s"
+        log "Скрипт: $dest/$s"
+      fi
     fi
   done
   if [[ -x "$dest/configure_sn_lsp.sh" ]]; then
